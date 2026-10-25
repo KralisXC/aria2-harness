@@ -1,4 +1,4 @@
-# Aria2-Harness 核心开发与架构大纲
+﻿# Aria2-Harness 核心开发与架构大纲
 
 ## 1. 项目概述与技术栈
 
@@ -45,8 +45,8 @@
 ## 6. 工程目录与关键文件
 
 - **C++**：`aria2-1.37.0/src/` — `Http2*.{h,cc}`（多路复用）、`SegmentMan.cc`（动态切割）、`SqliteProgressInfoFile.cc`（进度库）、`OptionHandlerFactory.cc`（128 上限）；`http2probe.cc` 探针；`mingw-*` 构建脚本。
-- **Rust**：`my-downloader/src-host/src/` — `main.rs`（窗口/事件循环/挂起）、`lib.rs`（命令面/引导/WS 循环）、`bin/aria2_service.rs`（SCM + 引擎）、`service_protocol.rs` / `service_client.rs`（IPC）、`rpc_client.rs`、`db.rs`、`paths.rs`、`degradation.rs`、`process_guard.rs`、`plugin/*`、`browser_api.rs`、`web_ui.rs`、`power.rs`、`notify.rs`、`update_check.rs`。
-- **Vue**：`my-downloader/src/` — `App.vue`、`ipc.ts`、`views/`、`stores/`、`utils/taskName.ts`；产物 `dist/`。
+- **Rust**：`client/src-host/src/` — `main.rs`（窗口/事件循环/挂起）、`lib.rs`（命令面/引导/WS 循环）、`bin/aria2_service.rs`（SCM + 引擎）、`service_protocol.rs` / `service_client.rs`（IPC）、`rpc_client.rs`、`db.rs`、`paths.rs`、`degradation.rs`、`process_guard.rs`、`plugin/*`、`browser_api.rs`、`web_ui.rs`、`power.rs`、`notify.rs`、`update_check.rs`。
+- **Vue**：`client/src/` — `App.vue`、`ipc.ts`、`views/`、`stores/`、`utils/taskName.ts`；产物 `dist/`。
 - **扩展**：`browser-extension/{manifest.json, background.js}`。
 - **打包**：`setup.iss`、`Aria2-Harness-v*-Windows-x64/`、`installer_output/`。
 

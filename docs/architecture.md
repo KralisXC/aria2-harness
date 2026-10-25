@@ -30,10 +30,10 @@ UI 进程永远普通权限，拿不到该特权 → `SetFileValidData` 必失�
 ```toml
 [package]
 autobins = false                 # 关掉自动发现，显式声明两个 bin
-default-run = "my-downloader"    # 指定默认目标，保住 cargo run / tauri dev
+default-run = "client"    # 指定默认目标，保住 cargo run / tauri dev
 
 [[bin]]
-name = "my-downloader"
+name = "client"
 path = "src/main.rs"
 
 [[bin]]
@@ -53,7 +53,7 @@ path = "src/bin/harness_service.rs"
 | `src-tauri/src/lib.rs` | 修改 | 剥离 `spawn_aria2`；`Aria2State` 重写；新增 `bootstrap_service`；`RunEvent::Exit` 改发 `shutdown` |
 | `src-tauri/src/process_guard.rs` | 修改（1 行） | `mod` → `pub mod`，供服务 bin 复用 Job Object 守护 |
 | `src-tauri/src/Cargo.toml` | 修改 | `autobins`/`default-run`/两个 `[[bin]]` + tokio features 扩充 |
-| `my-downloader/start_dev.ps1` | 新增 | 开发期一键启动：管理员起服务 → 普通权限起 UI（纯 ASCII，见 §6） |
+| `client/start_dev.ps1` | 新增 | 开发期一键启动：管理员起服务 → 普通权限起 UI（纯 ASCII，见 §6） |
 
 ### 1.4 职责边界
 
@@ -344,7 +344,7 @@ D:(A;;GRGW;;;WD)(A;;GA;;;SY)(A;;GA;;;BA)S:(ML;;NW;;;S-1-16-8192)
 ## 5. 边界红线（本项目对服务的硬约束）
 
 1. 服务**不得**直接打包为 Windows Service（不碰 `sc.exe`）；本阶段只是常驻 Console 程序，便于终端看日志。
-2. `harness-service.exe` / `my-downloader.exe` 路径**不得硬编码**；用相对路径或环境变量（`HARNESS_ARIA2_PATH` / `HARNESS_SERVICE_PIPE`）配置。
+2. `harness-service.exe` / `client.exe` 路径**不得硬编码**；用相对路径或环境变量（`HARNESS_ARIA2_PATH` / `HARNESS_SERVICE_PIPE`）配置。
 3. 引擎子进程生命周期由服务统一管理；退出时必须主动 kill，避免残留进程锁住目标文件。
 4. 启动前必须探测 RPC 端口（6800）；被占用只报错、**不自动 kill**，避免误杀用户手动启动的 aria2。
 5. **不得修改**底层 C++ 源码；行为调整只通过 RPC 配置与启动参数。
@@ -372,16 +372,16 @@ D:(A;;GRGW;;;WD)(A;;GA;;;SY)(A;;GA;;;BA)S:(ML;;NW;;;S-1-16-8192)
 ## 附 · 验证命令
 
 ```powershell
-cd <repo>\my-downloader\src-tauri
+cd <repo>\client\src-tauri
 cargo check --all-targets      # 0 error / 0 warning
 cargo test --lib               # 协议单测等
-cargo build --bins             # my-downloader.exe + harness-service.exe
+cargo build --bins             # client.exe + harness-service.exe
 
 # 提权自检（普通权限应打印红色横幅并以退出码 1 结束）
 .\target\debug\harness-service.exe ; $LASTEXITCODE
 
 # 开发期启动（管理员服务 + 普通权限 UI）
-cd <repo>\my-downloader
+cd <repo>\client
 powershell -ExecutionPolicy Bypass -File .\start_dev.ps1
 
 # 残留高权限服务排查（必须用「管理员身份运行」的 PowerShell，否则会被 MIC 拒绝）

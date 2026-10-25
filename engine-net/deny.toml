@@ -1,5 +1,5 @@
-# Q7 许可证审计（engine-net 独立 crate，W2 接法 → 逐 crate 审计）
-# 与 my-downloader/src-host/deny.toml 保持同一口径。
+﻿# Q7 许可证审计（engine-net 独立 crate，W2 接法 → 逐 crate 审计）
+# 与 client/src-host/deny.toml 保持同一口径。
 # 运行：在 engine-net 目录执行 cargo deny check licenses
 [licenses]
 version = 2

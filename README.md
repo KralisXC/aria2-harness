@@ -1,4 +1,4 @@
-# Aria2-Harness
+﻿# Aria2-Harness
 
 > **把下载器拆成三层，每层都用最合适的语言重写一遍。**
 > Rust 写 HTTP 栈、C++ 守 BT 老本行、Vue 画界面 —— 没有 Tauri，没有 Node 运行时，没有妥协。
@@ -108,15 +108,15 @@ Vue 3 + Pinia + naive-ui，WebView2 渲染：
 #### 1. 前端
 
 ```powershell
-cd my-downloader
+cd client
 npm ci
-npm run build          # 产物在 my-downloader/dist
+npm run build          # 产物在 client/dist
 ```
 
 #### 2. Rust 宿主（默认 MSVC 工具链）
 
 ```powershell
-cd my-downloader/src-host
+cd client/src-host
 cargo build --release --features native-http,wasm-runtime
 ```
 
@@ -129,7 +129,7 @@ cargo build --release --features native-http,wasm-runtime
 
 #### 2'. 纯 Clang 路线（gnullvm，可选）
 
-仓库里的 `my-downloader/.cargo/config.toml` 已给出模板，需要自己补齐三件事：
+仓库里的 `client/.cargo/config.toml` 已给出模板，需要自己补齐三件事：
 
 ```powershell
 # 1) rust-lld 不在 PATH，把它所在目录加进来
@@ -155,7 +155,7 @@ make -j$(nproc)
 strip src/aria2c.exe
 ```
 
-得到约 13.8MB 的静态 `aria2c.exe`，放进 `my-downloader/src-host/binaries/`。
+得到约 13.8MB 的静态 `aria2c.exe`，放进 `client/src-host/binaries/`。
 
 #### 4. 组装便携包
 
@@ -210,7 +210,7 @@ HOME 下的结构：
 ```
 aria2-harness/
 ├── engine-net/            # Harness-Net：原生 HTTP(S) 引擎（tokio/hyper/rustls/hickory）
-├── my-downloader/
+├── client/
 │   ├── src/               # Vue 3 前端（视图 / Pinia / IPC 封装）
 │   ├── src-host/          # Rust 宿主（lib + 双 bin + 插件系统 + SQLite）
 │   │   ├── src/           # main / service / router / rpc_client / db / paths ...
@@ -249,7 +249,7 @@ aria2-harness/
 ## 测试
 
 ```powershell
-cd my-downloader/src-host
+cd client/src-host
 cargo check --features native-http,wasm-runtime
 cargo test  --features native-http,wasm-runtime
 
@@ -263,7 +263,7 @@ cargo test  --features native-http
 
 ## 许可证
 
-- 自研部分（`engine-net/`、`my-downloader/`）：**MIT**
+- 自研部分（`engine-net/`、`client/`）：**MIT**
 - `aria2-1.37.0/`：aria2 的修改分支，仍受 **GPLv2** 约束。分发含 `aria2c.exe` 的二进制包时，请同时履行 GPLv2 的源码提供义务。
 
 详见 [LICENSE](LICENSE)。
