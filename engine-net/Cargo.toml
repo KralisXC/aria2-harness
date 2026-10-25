@@ -1,0 +1,98 @@
+[package]
+name = "engine-net"
+version = "1.0.0-beta8"
+edition = "2024"
+description = "Aria2-Harness 原生 HTTP(S) 引擎（C-3）"
+publish = false
+
+# ---------------------------------------------------------------------------
+# W2 接法（Q4 已签字）：独立 crate + 路径依赖，**不建 workspace**。
+# 版本策略：与 src-host/Cargo.lock 一致的用精确版本 `=x.y.z`；src-host 未声明的
+# 取当前稳定版并同样精确锁死（用户 2026-10-24 要求：防止两个独立 lock 漂移）。
+# TLS provider 与 src-host 对齐：**ring**（src-host 锁定 ring 0.17.14，无 aws-lc-rs）。
+# ---------------------------------------------------------------------------
+[dependencies]
+tokio = { version = "=1.53.3", features = [
+    "rt-multi-thread",
+    "net",
+    "fs",
+    "sync",
+    "time",
+    "macros",
+    "io-util",
+    "signal",
+] }
+# Phase 3：HTTP/1.1 + HTTP/2（Q6 基线）。h2 仅经 TLS ALPN 协商，不做 h2c。
+hyper = { version = "=1.8.1", default-features = false, features = ["client", "http1", "http2"] }
+hyper-util = { version = "=0.1.17", default-features = false, features = [
+    "client-legacy",
+    "tokio",
+] }
+http = "=1.5.0"
+http-body-util = "=0.1.3"
+# 证书校验与 SNI 解耦（Q9）：TCP 连 IP、ServerName 用域名。
+rustls = { version = "=0.23.46", default-features = false, features = ["std", "tls12", "ring"] }
+tokio-rustls = { version = "=0.26.4", default-features = false, features = ["tls12", "ring"] }
+webpki-roots = "=1.0.10"
+# Phase 4：信任根走操作系统证书存储（Windows CurrentUser/LocalMachine Root），
+# 解决企业内网 CA 无法出现在 webpki 内置根的问题；构造失败时回退 webpki-roots。
+rustls-platform-verifier = "=0.6.2"
+# 客户端证书/私钥 PEM 解析（`--certificate` / `--private-key`，aria2 同名选项）。
+rustls-pemfile = "=2.2.0"
+# 代理 Basic 认证的 `Proxy-Authorization: Basic <base64>`（对齐 HttpRequest.cc:357）。
+base64 = "=0.22.1"
+# DNS 垂直切片（Q8）：替换 c-ares，是 Phase 1 的核心验证点。
+hickory-resolver = { version = "=0.25.2", default-features = false, features = [
+    "tokio",
+    "system-config",
+] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
+thiserror = "=2.0.21"
+# 控制文件 SHA-1 去重（与 DefaultBtProgressInfoFile 对齐，Phase 1 5.4.4 使用）。
+sha1 = "=0.10.7"
+# 进度持久化（Phase 2 起）：`<file>.sqlite` 控制文件（产品 `--sqlite-progress=true`
+# 的默认格式）+ GID 映射共用同一份 rusqlite；版本与 src-host 严格一致。
+rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled", "cache"] }
+
+[features]
+default = []
+# Phase 2 起由 service 通过 `--features native-http` 带入（src-host/Cargo.toml 已声明）。
+native-http = []
+
+# 控制文件原子替换：MoveFileExW(REPLACE_EXISTING)，与 aria2 `<file>__temp` + rename 对齐。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+# A/B 一致性测试的 SHA256 比对（§5.4.7）。
+sha2 = "=0.10.9"
+# Phase 3 TLS/H2 测试服务器：自签证书与客户端证书（仅测试期编译）。
+rcgen = "=0.14.10"
+# 测试期临时目录（证书、目标文件）。
+tempfile = "=3.27.0"
+# hyper server 特性只在测试构建里启用，产品构建仍是 client-only。
+hyper = { version = "=1.8.1", default-features = false, features = [
+    "server",
+    "http1",
+    "http2",
+] }
+
+# §5.5 并发基线：GetProcessMemoryInfo / GetProcessHandleCount 采样子进程 RSS 与句柄数。
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "=0.61.2", features = [
+  "Win32_Foundation",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_ProcessStatus",
+  "Win32_System_Threading",
+] }
+
+[lib]
+name = "engine_net"
+path = "src/lib.rs"
+
+[[bin]]
+name = "engine-net"
+path = "src/bin/engine_net.rs"

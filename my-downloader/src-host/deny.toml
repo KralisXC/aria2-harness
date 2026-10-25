@@ -1,0 +1,33 @@
+# Q7 许可证审计配置（定稿 2026-10-24，用户签字：按实测最小宽松集）
+# 红线 R8 修订说明见 docs/c3/Q7-licenses.md §2：原定「纯 MIT」在生态现状下不可达，
+# 已放宽为「GPLv2 兼容的宽松许可集」+ MPL-2.0 crate 级例外。
+# 运行：cargo deny check licenses
+[licenses]
+version = 2
+confidence-threshold = 0.8
+private = { ignore = true }
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "0BSD",
+    "Zlib",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "MIT-0",
+    "Unlicense",
+    "CDLA-Permissive-2.0",
+]
+# MPL-2.0 为文件级弱 copyleft：不修改源码、仅作为依赖链接，可随闭源程序分发。
+# cssparser / cssparser-macros / dtoa-short / selectors 仅存在于 Linux(gtk/webkit) 目标图，
+# Windows 产物不包含；option-ext 经 dirs → dirs-sys 进入 Windows 产物。
+exceptions = [
+    { allow = ["MPL-2.0"], crate = "option-ext" },
+    { allow = ["MPL-2.0"], crate = "cssparser" },
+    { allow = ["MPL-2.0"], crate = "cssparser-macros" },
+    { allow = ["MPL-2.0"], crate = "dtoa-short" },
+    { allow = ["MPL-2.0"], crate = "selectors" },
+]

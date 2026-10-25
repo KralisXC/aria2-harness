@@ -1,0 +1,56 @@
+# ---- Rust ----
+target/
+**/target/
+*.pdb
+*.rlib
+*.rmeta
+
+# ---- Node / 前端 ----
+node_modules/
+**/node_modules/
+dist/
+dist-ssr/
+*.local
+npm-debug.log*
+pnpm-debug.log*
+
+# ---- 运行期数据（绝不入库）----
+data/
+logs/
+downloads/
+plugins/
+config.json
+aria2.session
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+*.db-shm
+*.db-wal
+
+# ---- 打包产物 ----
+installer_output/
+Aria2-Harness-v*/
+*.exe
+*.msi
+
+# ---- aria2 C++ 构建残留 ----
+aria2-1.37.0/Makefile
+aria2-1.37.0/config.status
+aria2-1.37.0/config.log
+aria2-1.37.0/autom4te.cache/
+aria2-1.37.0/**/*.o
+aria2-1.37.0/**/*.lo
+aria2-1.37.0/**/*.a
+aria2-1.37.0/**/*.la
+aria2-1.37.0/**/.libs/
+aria2-1.37.0/**/.deps/
+
+# ---- 编辑器 / 系统 ----
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.suo

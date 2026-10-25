@@ -1,0 +1,286 @@
+@import "tailwindcss";
+
+/*
+ * Aria2-Harness L3 视觉基线（Motrix 风 · 亮色优先）。
+ *
+ * 设计约束（见 ui.md）：
+ * - 背景 #f0f7f7，主内容为白色大圆角卡片，柔和阴影；
+ * - 圆角统一：外层 24 / 卡片 20 / 导航 12 / 按钮 10；
+ * - 亮色为默认，暗色仅作为兜底变量（本轮不精修）。
+ */
+:root {
+  color-scheme: light;
+
+  --bg: #f0f7f7;
+  --surface: #ffffff;
+  --surface-2: #f7fafa;
+  --surface-3: #eef4f4;
+  --line: #e7eeee;
+  --line-strong: #d9e5e5;
+
+  --text: #1f2d2c;
+  --text-2: #4c5e5d;
+  --muted: #8a9b9a;
+
+  --accent: #14b8a6;
+  --accent-hover: #0d9c8c;
+  --accent-soft: #e6f7f4;
+  --danger: #ef4444;
+  --danger-soft: #fdecec;
+  --warn: #f59e0b;
+  --warn-soft: #fff6e5;
+  --success: #22c55e;
+  --success-soft: #e9f9ef;
+  --purple: #8b5cf6;
+  --purple-soft: #f1ecfe;
+
+  --shadow-card: 0 4px 20px rgba(0, 0, 0, 0.03);
+  --shadow-float: 0 10px 30px rgba(20, 60, 60, 0.08);
+
+  --r-outer: 24px;
+  --r-card: 20px;
+  --r-nav: 12px;
+  --r-btn: 10px;
+
+  --sidebar-w: 232px;
+  --sidebar-w-collapsed: 76px;
+  --scroll-thumb: #cfdede;
+}
+
+html.dark {
+  color-scheme: dark;
+
+  --bg: #0d1517;
+  --surface: #131d1f;
+  --surface-2: #172225;
+  --surface-3: #1d2a2d;
+  --line: #243336;
+  --line-strong: #2d3f43;
+
+  --text: #e4efed;
+  --text-2: #b3c6c3;
+  --muted: #7f9391;
+
+  --accent: #2dd4bf;
+  --accent-hover: #5eead4;
+  --accent-soft: #14332f;
+  --danger: #f87171;
+  --danger-soft: #35201f;
+  --warn: #fbbf24;
+  --warn-soft: #33280f;
+  --success: #4ade80;
+  --success-soft: #12301c;
+  --purple: #a78bfa;
+  --purple-soft: #241d3d;
+
+  --shadow-card: 0 4px 20px rgba(0, 0, 0, 0.25);
+  --shadow-float: 0 10px 30px rgba(0, 0, 0, 0.4);
+  --scroll-thumb: #2b3d40;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+html,
+body {
+  background: var(--bg);
+}
+
+body {
+  color: var(--text);
+  font-family:
+    "Inter", "Segoe UI", "Microsoft YaHei", "PingFang SC", "Hiragino Sans GB",
+    system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  overflow: hidden;
+  -webkit-user-drag: none;
+}
+
+#app {
+  height: 100%;
+  overflow: hidden;
+}
+
+#app > .n-config-provider {
+  height: 100%;
+}
+
+/* 去浏览器化：全局禁选中，输入类元素放开（红线）。 */
+* {
+  user-select: none;
+  box-sizing: border-box;
+}
+input,
+textarea,
+[contenteditable="true"] {
+  user-select: text;
+}
+
+/* 自定义滚动条：细、圆、低对比。 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--scroll-thumb);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--accent) 45%, var(--scroll-thumb));
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* 数字：系统字体但等宽对齐，字号由使用处决定。 */
+.num {
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+}
+
+/* ------------------------------------------------------------------ */
+/* 原生控件基线（naive-ui 之外的视图共用）                              */
+/* ------------------------------------------------------------------ */
+
+input[type="text"],
+input[type="number"],
+input[type="search"] {
+  padding: 9px 13px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-btn);
+  background: var(--surface-2);
+  color: var(--text);
+  font: inherit;
+  outline: none;
+  transition:
+    border-color 0.15s ease,
+    box-shadow 0.15s ease,
+    background 0.15s ease;
+}
+input::placeholder {
+  color: var(--muted);
+  opacity: 0.85;
+}
+input:focus {
+  background: var(--surface);
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+button {
+  padding: 8px 15px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-btn);
+  background: var(--surface);
+  color: var(--text-2);
+  font: inherit;
+  cursor: pointer;
+  transition:
+    border-color 0.15s ease,
+    color 0.15s ease,
+    background 0.15s ease,
+    transform 0.12s ease;
+}
+button:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+  color: var(--accent);
+}
+button:active:not(:disabled) {
+  transform: translateY(1px);
+}
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* 通用按钮变体 */
+.btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #ffffff;
+  font-weight: 600;
+}
+.btn-primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+  color: #ffffff;
+}
+
+.btn-ghost {
+  background: transparent;
+  border-color: transparent;
+  color: var(--text-2);
+}
+.btn-ghost:hover:not(:disabled) {
+  background: var(--surface-3);
+  border-color: transparent;
+  color: var(--text);
+}
+
+.btn-danger {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 30%, var(--line));
+}
+.btn-danger:hover:not(:disabled) {
+  background: var(--danger-soft);
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+/* 图标按钮（顶栏 / 卡片操作） */
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border-radius: var(--r-btn);
+  background: transparent;
+  border-color: transparent;
+  color: var(--muted);
+}
+.icon-btn:hover:not(:disabled) {
+  background: var(--surface-3);
+  border-color: transparent;
+  color: var(--text);
+}
+.icon-btn.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+/* 文本状态 */
+.status {
+  min-height: 1.4em;
+  font-size: 0.9em;
+  color: var(--muted);
+}
+.empty {
+  color: var(--muted);
+}
+
+/* 路由切换过渡 */
+.page-enter-active,
+.page-leave-active {
+  transition:
+    opacity 0.16s ease,
+    transform 0.16s ease;
+}
+.page-enter-from,
+.page-leave-to {
+  opacity: 0;
+  transform: translateY(4px);
+}

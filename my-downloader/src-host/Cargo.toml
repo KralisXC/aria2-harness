@@ -1,0 +1,197 @@
+﻿[package]
+name = "aria2-harness"
+version = "1.0.0-beta8"
+description = "Aria2-Harness —— 模块化自进化下载器（aria2 引擎 + Rust 宿主 + WebView UI）"
+authors = ["lingxi"]
+edition = "2024"
+# Q7/D-b（2026-10-24 用户签字）：内部工具，不发布到 crates.io。
+# `publish = false` 同时让 cargo-deny 把本包视为 private，跳过「自身未声明 license」检查。
+publish = false
+# 增量 23：本 package 现在是"双 bin"（UI + 核心服务）。必须显式关闭自动发现
+# 并给出 default-run，否则 `cargo run`（tauri-cli 内部就是这么跑的）会因
+# 多目标二义性而报错，进而破坏 `npm run tauri dev`。
+autobins = false
+default-run = "aria2-harness"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+# 阶段三：剥离 Tauri 后不再产生 staticlib/cdylib 产物，仅保留 rlib 供 bin 复用。
+name = "aria2_harness_lib"
+crate-type = ["rlib"]
+
+# UI 层（普通权限）：只负责界面、Tauri 命令与 RPC 转发。
+[[bin]]
+name = "aria2-harness"
+path = "src/main.rs"
+
+# 核心服务（较高权限，本轮为常驻 Console）：由它拉起/监控/销毁 aria2c。
+[[bin]]
+name = "aria2-service"
+path = "src/bin/aria2_service.rs"
+
+# 增量 25：Wasm 强隔离插件后端（P2-D）。
+# 必须**显式**开启，默认不编译 —— 保证 wasmtime（体积/编译成本大）不影响常规构建。
+#   cargo check  --features wasm-runtime
+#   cargo build  --features wasm-runtime
+# manifest 声明 "engine": "wasm" 但未带此 feature 时，加载会返回明确错误（见 wasm_runtime.rs）。
+[features]
+default = []
+wasm-runtime = ["dep:wasmtime"]
+# C-3：原生 HTTP(S) 引擎（engine-net）。默认关闭 = 完全沿用 aria2c，可随时回退（D2）。
+#   cargo check --features native-http
+# Phase 0 只接空壳 crate，不接业务；未开此 feature 时 `--engine=native` 会明确拒绝启动。
+native-http = ["dep:engine-net"]
+
+[build-dependencies]
+# 增量 26 · 阶段二（续）：显式声明 cc，借此把 rquickjs-sys 间接依赖的 cc 版本
+# 统一拉升到最新的 1.2.x（cargo 会对同一 semver 区间内的 cc 做版本合一）。
+# 新版 cc 对 `*-windows-gnullvm` 这种 clang 无法识别的 target triple 处理更稳。
+cc = "1.2"
+
+[dependencies]
+# 阶段三：移除 tauri 后，UI 外壳改为手写 tao（窗口）+ wry（WebView2）。
+tao = { version = "0.37", default-features = false, features = ["rwh_06"] }
+wry = { version = "0.57", default-features = false, features = ["os-webview"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 增量 27（P2-A）：统一错误模型。仅用 derive 宏（`thiserror = "2"`），
+# `Serialize` 手写在 error.rs 里（derive 会退化成 externally-tagged 形状）。
+thiserror = "2"
+# 增量 28（P2-B）：任务历史 SQLite 持久化。
+# `bundled` 自带 SQLite C 源码（免系统依赖），由 `cc` 编译 —— 与 rquickjs 同一套 C 工具链，
+# 本机 MSVC 已实测可编译（libsqlite3-sys 0.38.2 + cc 1.8.0）。
+# 刻意 `default-features = false`：0.40 的 default 含 `ffi-sqlite-wasm-rs`（wasm 专用 FFI），
+# 对 Windows 目标是死重；保留 `cache`（= `prepare_cached` 语句缓存）。
+rusqlite = { version = "0.40", default-features = false, features = ["bundled", "cache"] }
+# WebSocket 传输层（自研 JSON-RPC 客户端的底座，见 src/rpc_client.rs）。
+# 刻意 `default-features = false`：只走明文 ws://（本机回环），不需要 TLS 栈。
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect"] }
+# 流/接收器适配（`StreamExt` / `SinkExt`），只取 sink + std。
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+# UI 侧：后台重连退避的 sleep、状态共享的 async Mutex。
+# 增量 23 新增：`net`（Windows 命名管道）+ `io-util`（AsyncRead/Write 扩展与 BufReader）
+# 供 UI 侧命名管道客户端使用；`macros` + `rt-multi-thread` 供 aria2-service 的
+# `#[tokio::main]` 使用（同一 package 的依赖是共享的）。
+tokio = { version = "1", features = [
+    "time",
+    "sync",
+    "net",
+    "io-util",
+    "macros",
+    "rt-multi-thread",
+] }
+# 启动时生成随机 rpc-secret，杜绝硬编码
+uuid = { version = "1", features = ["v4"] }
+# 审计日志本地时间戳（仅需 clock，避免拉入 wasm 相关特性）
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# 阶段三插件引擎：QuickJS in-process 逻辑沙箱
+# M1 全同步执行，因此只启用 std（不启 futures/loader/macro）；ES module 由
+# 预注入的 harness 全局门面代替（见 src/plugin/quickjs.rs）
+rquickjs = { version = "0.14", default-features = false, features = ["std"] }
+# 插件完整性校验（manifest.integrity 逐文件 SHA-256）
+sha2 = "0.11.1"
+# 可观测性底座（增量 18）：tracing 事件 + 按天轮转落盘 + RUST_LOG 级别过滤
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+# 系统「下载」文件夹解析：`dirs` 内部走 SHGetKnownFolderPath(FOLDERID_Downloads)，
+# 比手写注册表 User Shell Folders 更可靠（含 OneDrive 重定向场景）。
+dirs = "5"
+# 增量 26：插件目录文件监听（热重载）。仅用同步 `RecommendedWatcher` 置于专属
+# std 线程，绝不占用 tokio 事件循环。
+notify = "6"
+# 增量 46：轻量自动更新检查（GET version.json）。
+# 只取 `rustls`（ring 后端 + webpki-roots），关掉 gzip/brotli/charset —— 清单是几行
+# 纯 ASCII JSON，不值得为解压多拉两个原生依赖。
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+# 增量 25：Wasm 强隔离插件运行时（可选，由 `wasm-runtime` feature 门控）。
+# 只取必要特性：cranelift（JIT）+ runtime + wat（直接吃 WAT 文本，免额外编译工具链）。
+# 刻意关掉 parallel-compilation / cache / async / component-model，控制编译成本与体积。
+wasmtime = { version = "49.0.3", default-features = false, features = ["cranelift", "runtime", "wat"], optional = true }
+# C-3：原生 HTTP(S) 引擎空壳（Phase 0 零依赖）。路径依赖而非 workspace：
+# 根目录不引入 workspace（Q4 的 W1/W2 尚未签字），保持现有构建零变化。
+engine-net = { path = "../../engine-net", optional = true }
+windows-service = "0.8.1"
+
+# 仅 Windows：Job Object 守护 sidecar（父进程退出/崩溃时内核自动 kill 子进程）。
+# 放在 target 专属依赖里，非 Windows 平台完全不参与编译。
+[target.'cfg(windows)'.dependencies]
+# 系统托盘 + 右键菜单（tao 0.37 没有 tray 特性，使用官方同源的独立 crate）。
+# `default-features = false` 去掉 Linux 的 GTK / libappindicator 依赖，Windows 端零额外系统库。
+tray-icon = { version = "0.25", default-features = false }
+# 设置页「开机自动启动」：读写 HKCU\...\Run（仅当前用户，无需管理员权限）。
+winreg = "0.56"
+# 应用图标解码：`include_bytes!` 嵌入 `ico/AR HNS · *.ico`，运行期解出 RGBA 供
+# tao 窗口图标 / 任务栏 / 托盘共用同一视觉。纯本地解码（png 0.17），无系统依赖。
+ico = "0.5"
+# 系统级原生通知（Windows Toast）。仅 Windows：依赖 windows 0.62（与项目内版本一致），
+# 非 Windows 平台完全不参与编译。
+tauri-winrt-notification = "0.8"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    # 增量 24：命名管道显式 DACL —— SDDL → SECURITY_ATTRIBUTES
+    # （`ConvertStringSecurityDescriptorToSecurityDescriptorW` / `SDDL_REVISION_1`）
+    "Win32_Security_Authorization",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    # 增量 40：系统休眠 / 网络切换感知（power.rs）
+    #   Win32_System_Power              → PowerRegisterSuspendResumeNotification
+    #   Win32_UI_WindowsAndMessaging    → REGISTER_NOTIFICATION_FLAGS / PBT_APM*
+    #   Win32_NetworkManagement_IpHelper → NotifyNetworkConnectivityHintChange
+    #   Win32_Networking_WinSock        → NL_NETWORK_CONNECTIVITY_HINT
+    "Win32_System_Power",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+    # 增量 41：DLL 安全加载（SetDefaultDllDirectories + LOAD_LIBRARY_SEARCH_SYSTEM32）
+    "Win32_System_LibraryLoader",
+    # 发布补丁：aria2-service Release 隐身 —— stdout/stderr 句柄重定向到 service.log
+    #   Win32_System_Console → SetStdHandle / STD_OUTPUT_HANDLE / STD_ERROR_HANDLE
+    "Win32_System_Console",
+    # 设置页「默认下载目录」：原生 IFileOpenDialog 文件夹选择器
+    #   Win32_UI_Shell            → FileOpenDialog / IFileOpenDialog / FOS_PICKFOLDERS / SIGDN_FILESYSPATH
+    #   Win32_UI_Shell_Common     → SIGDN / 公共 Shell 类型
+    #   Win32_System_Com          → CoInitializeEx / CoCreateInstance / CoTaskMemFree
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_System_Com",
+    # 增量 46：进程级 DPI 感知（SetProcessDpiAwarenessContext / PER_MONITOR_AWARE_V2）
+    "Win32_UI_HiDpi",
+    # v1.0-beta2：服务以 LocalSystem 运行时，解析当前登录用户的真实下载目录
+    #   Win32_System_RemoteDesktop → WTSGetActiveConsoleSessionId / WTSQueryUserToken
+    #   Win32_System_Environment   → CreateEnvironmentBlock / DestroyEnvironmentBlock
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Environment",
+] }
+
+# 增量 26 · 阶段二：gnullvm 下 rquickjs-sys 未内置 `bindings/x86_64-pc-windows-gnullvm.rs`
+# （仅有 -gnu / -msvc），官方建议改用 `bindgen` 在构建期生成绑定。
+# **仅对 gnullvm 目标生效** —— MSVC 日常构建不受影响：rquickjs-sys 的 build.rs 在
+# `target == host` 时直接复用内置 bindings，根本不跑 bindgen（见其 build.rs 351-364 行）。
+# 需要 libclang：`LIBCLANG_PATH=<LLVM_ROOT>\bin`。
+[target.x86_64-pc-windows-gnullvm.dependencies]
+rquickjs = { version = "0.14", default-features = false, features = ["std", "bindgen"] }
+
+[dev-dependencies]
+# verify_integrity 单测用临时目录，测试结束自动清理，绝不污染真实下载目录
+tempfile = "3"
+# Phase 5：降级阶梯单测需要起一个假 WS JSON-RPC 引擎。
+# 产品依赖仍只有 connect；这里额外开启 handshake，仅测试构建生效。
+tokio-tungstenite = { version = "0.29", default-features = false, features = [
+    "connect",
+    "handshake",
+] }
+
+
+# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true

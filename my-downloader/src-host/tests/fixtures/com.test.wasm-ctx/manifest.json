@@ -1,0 +1,20 @@
+{
+  "id": "com.test.wasm-ctx",
+  "name": "探针插件：Wasm 完整 ctx 通路",
+  "description": "验证 Wasm 后端与 JS 后端能力对等：经 env.host_call 打通 ctx.log / ctx.notify / ctx.getTask / ctx.settings.get（回包指针经 last_result_ptr 暴露给宿主断言）。",
+  "version": "0.1.0",
+  "apiVersion": "1",
+  "entry": "plugin.wat",
+  "engine": "wasm",
+  "priority": 100,
+  "hooks": ["onAppStart", "onDownloadComplete", "onDownloadError", "onShutdown"],
+  "permissions": ["notify", "downloads:read"],
+  "settings": [{ "key": "greeting", "default": "wasm-ctx-ok" }],
+  "limits": { "timeoutMs": 2000, "memoryMB": 16, "fuelUnits": 200000 },
+  "integrity": {
+    "algorithm": "sha256",
+    "files": {
+      "plugin.wat": "c3a52ecffada48373693c4b653938833d91d0ab330ba221545df70557eda45ea"
+    }
+  }
+}

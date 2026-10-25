@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "Aria2-Harness",
+  "version": "1.0.2",
+  "description": "把浏览器下载交给本机的 Aria2-Harness：点击图标切换接管，角标显示 ON / OFF / ERR。",
+  "permissions": ["downloads", "cookies", "storage", "activeTab", "alarms", "notifications"],
+  "host_permissions": [
+    "<all_urls>",
+    "http://127.0.0.1/*",
+    "http://localhost/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Aria2-Harness 接管（点击切换）"
+  },
+  "icons": {
+    "128": "icon128.png"
+  }
+}

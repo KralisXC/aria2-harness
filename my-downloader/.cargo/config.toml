@@ -1,0 +1,27 @@
+# 纯 Clang/LLVM 工具链（gnullvm）配置 —— 可选，显式 opt-in
+#
+# ⚠️ 刻意**不设置全局 `[build] target`**：
+#    那样会让 `cargo build` 默认走 gnullvm，日常 MSVC 开发闭环会被 disrupt。
+#    仅在需要 gnullvm 时显式指定：
+#      cargo build --target x86_64-pc-windows-gnullvm --features native-http,wasm-runtime
+#
+# 使用前提（三个都必须满足）：
+#   1. rust-std / rust-mingw 的 gnullvm 组件已安装到当前 toolchain。
+#   2. `rust-lld` 不在 PATH（它随 host toolchain 分发）。请把
+#      `<RUSTUP_HOME>/toolchains/<host>/lib/rustlib/x86_64-pc-windows-msvc/bin`
+#      加入 PATH，或把下面的 `linker` 改成你自己机器上的绝对路径。
+#   3. `clang` 必须可达（rquickjs 的 QuickJS 是 C 源码，由 `cc` crate 编译）。
+#      clang 在 `*-windows-gnu*` 目标下会通过 PATH 找 GCC 安装来推导 sysroot，
+#      因此 PATH 里还要有 MSYS2 的 `mingw64/bin`；找不到 advapi32 等导入库时，
+#      把下面的 `-Clink-arg` 改成你的 MSYS2 `<root>/mingw64/lib` 再取消注释。
+#
+# 构建脚本会用到 libclang（rquickjs 的 bindgen），请自行设置环境变量：
+#   LIBCLANG_PATH=<LLVM_ROOT>\bin
+[target.x86_64-pc-windows-gnullvm]
+linker = "rust-lld.exe"
+rustflags = [
+    "-Clink-self-contained=yes",
+    "-Ctarget-feature=+crt-static",
+    # 缺 advapi32 等导入库时按需启用（路径换成自己的 MSYS2）：
+    # "-Clink-arg=-L<MSYS2_ROOT>/mingw64/lib",
+]
