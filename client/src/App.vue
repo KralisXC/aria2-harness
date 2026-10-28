@@ -15,13 +15,18 @@ import TopBar from "./components/TopBar.vue";
 import AppIcon from "./components/AppIcon.vue";
 import SettingsView from "./views/SettingsView.vue";
 import UpdateNotifier from "./components/UpdateNotifier.vue";
-import { useDownloadsStore } from "./stores/downloads";
+import { useDownloadsStore, type PluginTask } from "./stores/downloads";
 import { useInterceptStore, type InterceptPayload } from "./stores/intercept";
-import { usePluginsStore } from "./stores/plugins";
+import { usePluginsStore, resolveExecConsent } from "./stores/plugins";
 import { useThemeStore } from "./stores/theme";
 import { useNotificationsStore } from "./stores/notifications";
 import { useSystemStore } from "./stores/system";
 import { taskDisplayName } from "./utils/taskName";
+import {
+  installPluginFiles,
+  installPluginZip,
+  readAsBase64,
+} from "./utils/pluginInstall";
 
 interface Aria2Event {
   type: "connected" | "disconnected" | "aria2" | "ws_connected" | "ws_closed";
@@ -33,6 +38,7 @@ let unlisten: UnlistenFn | null = null;
 let unlistenBreaker: UnlistenFn | null = null;
 let unlistenReload: UnlistenFn | null = null;
 let unlistenIntercept: UnlistenFn | null = null;
+let unlistenPluginTask: UnlistenFn | null = null;
 
 const store = useDownloadsStore();
 const interceptStore = useInterceptStore();
@@ -45,6 +51,30 @@ const route = useRoute();
 const router = useRouter();
 
 const currentTheme = computed(() => (themeStore.isDark ? darkTheme : lightTheme));
+
+/**
+ * beta12.1 冷启动宽限：应用启动 15 秒内连接失败只在 UI 显示「连接中...」，
+ * 绝不推错误通知；成功连过一次之后再断开才允许通知。
+ */
+const COLD_START_GRACE_MS = 15_000;
+const bootAt = Date.now();
+let everConnected = false;
+
+/** 引擎可用：记录「成功连过一次」，这是后续断开通知的唯一前提。 */
+function markEngineConnected() {
+  everConnected = true;
+  connection.value = "connected";
+}
+
+/** 引擎不可用：宽限期内保持 connecting；只有当「连过再断」时才推通知。 */
+function markEngineOffline(notify: boolean) {
+  const withinGrace = !everConnected && Date.now() - bootAt < COLD_START_GRACE_MS;
+  connection.value = withinGrace ? "connecting" : "disconnected";
+  if (!notify || !everConnected || withinGrace) return;
+  notices.push("warn", "引擎连接断开", "正在尝试自动重连，请检查核心服务状态", {
+    dedupeKey: "engine-disconnected",
+  });
+}
 
 const commonFonts = {
   // 优先 Inter（未安装时回退系统无衬线）。
@@ -99,6 +129,9 @@ const currentOverrides = computed(() =>
 );
 
 const collapsed = ref(readCollapsed());
+
+/** beta9：下载页由虚拟列表独立滚动，外层容器不再参与滚动。 */
+const downloadsPage = computed(() => route.name === "downloads");
 
 /** 设置弹窗（beta7）：不再走路由页面，主界面背景保留，居中弹出。 */
 const settingsOpen = ref(false);
@@ -216,8 +249,10 @@ let focusTimer = 0;
 async function syncOnFocus() {
   await store.refreshNow();
   const online = await invoke<boolean>("get_engine_status").catch(() => false);
-  connection.value = online ? "connected" : "disconnected";
-  if (!online) {
+  if (online) {
+    markEngineConnected();
+  } else {
+    markEngineOffline(false);
     await invoke<boolean>("reconnect_engine").catch(() => false);
   }
 }
@@ -304,22 +339,51 @@ function onDragLeave() {
   if (dragDepth === 0) dragActive.value = false;
 }
 
-/** 把 File 读成 base64（分块拼接，避免大种子触发 `String.fromCharCode` 参数上限）。 */
-function readAsBase64(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const bytes = new Uint8Array(reader.result as ArrayBuffer);
-      const chunk = 0x8000;
-      let binary = "";
-      for (let offset = 0; offset < bytes.length; offset += chunk) {
-        binary += String.fromCharCode(...bytes.subarray(offset, offset + chunk));
-      }
-      resolve(btoa(binary));
-    };
-    reader.onerror = () => reject(reader.error ?? new Error("读取种子文件失败"));
-    reader.readAsArrayBuffer(file);
-  });
+// ---------------------------------------------------------------------------
+// 插件安装（beta12.1）：拖入 .zip 或文件夹，批量结果由公共模块统一提示
+// ---------------------------------------------------------------------------
+
+/** 递归读取拖入的文件夹（分批读取，目录项数量没有单次上限）。 */
+async function readDirectoryEntries(
+  entry: FileSystemDirectoryEntry,
+  prefix = "",
+): Promise<Array<{ path: string; data: string }>> {
+  const reader = entry.createReader();
+  const children: FileSystemEntry[] = [];
+  for (;;) {
+    const batch = await new Promise<FileSystemEntry[]>((resolve, reject) =>
+      reader.readEntries(resolve, reject),
+    );
+    if (batch.length === 0) break;
+    children.push(...batch);
+  }
+  const files: Array<{ path: string; data: string }> = [];
+  for (const child of children) {
+    const path = `${prefix}${child.name}`;
+    if (child.isDirectory) {
+      files.push(
+        ...(await readDirectoryEntries(child as FileSystemDirectoryEntry, `${path}/`)),
+      );
+      continue;
+    }
+    const file = await new Promise<File>((resolve, reject) =>
+      (child as FileSystemFileEntry).file(resolve, reject),
+    );
+    files.push({ path, data: await readAsBase64(file) });
+  }
+  return files;
+}
+
+async function installPluginFolder(
+  entry: FileSystemDirectoryEntry,
+  source: string,
+) {
+  try {
+    const files = await readDirectoryEntries(entry);
+    await installPluginFiles(files, source);
+  } catch (error) {
+    notices.push("error", "插件安装失败", `${source}：${errText(error)}`);
+  }
 }
 
 async function addTorrentFile(file: File) {
@@ -341,17 +405,35 @@ async function onDrop(e: DragEvent) {
   dragDepth = 0;
   dragActive.value = false;
 
+  // 文件夹只能通过 items 的 entry 拿到（files 里不含目录项），故先处理目录。
+  const entries = Array.from(e.dataTransfer?.items ?? [])
+    .filter((item) => item.kind === "file")
+    .map((item) => item.webkitGetAsEntry?.() ?? null)
+    .filter((entry): entry is FileSystemEntry => entry !== null);
+
+  const folder = entries.find((entry) => entry.isDirectory);
+  if (folder) {
+    await installPluginFolder(folder as FileSystemDirectoryEntry, folder.name);
+    return;
+  }
+
   const files = Array.from(e.dataTransfer?.files ?? []);
+  // 允许多个 zip 一次拖入（beta12.1 批量安装），逐个交给后端。
+  const pluginZips = files.filter((file) => file.name.toLowerCase().endsWith(".zip"));
+  if (pluginZips.length > 0) {
+    for (const zip of pluginZips) await installPluginZip(zip);
+    return;
+  }
   const torrent = files.find((file) => file.name.toLowerCase().endsWith(".torrent"));
   if (torrent) {
     await addTorrentFile(torrent);
     return;
   }
-  if (files.length > 0) {
+  if (files.length > 0 && files[0].size > 0) {
     notices.push(
       "warn",
       "不支持的文件类型",
-      `目前只支持 .torrent 种子文件，收到：${files[0].name}`,
+      `支持 .torrent 种子与 .zip 插件包（或直接拖入插件文件夹），收到：${files[0].name}`,
     );
     return;
   }
@@ -377,7 +459,7 @@ async function onDrop(e: DragEvent) {
   notices.push(
     "warn",
     "无法识别拖入内容",
-    "支持 http / https / magnet 链接与 .torrent 种子文件",
+    "支持 http / https / magnet 链接、.torrent 种子与 .zip 插件包（或插件文件夹）",
   );
 }
 
@@ -415,17 +497,30 @@ onMounted(async () => {
   unlisten = await listen<Aria2Event>("aria2://event", async (ev) => {
     const payload = ev.payload;
 
-    if (payload.type === "connected" || payload.type === "ws_connected") {
-      connection.value = "connected";
+    if (payload.type === "connected") {
+      // 宿主已用 `aria2.getVersion` 探针确认引擎可用，可直接转绿。
+      markEngineConnected();
+      await bootstrap();
+      return;
+    }
+
+    if (payload.type === "ws_connected") {
+      // beta9.1：WS 握手成功 ≠ 引擎可用（服务被强杀时回环 TCP 仍可能握手成功）。
+      // 必须再经宿主的真实探针确认，超时/失败一律保持断开，绝不提前转绿。
+      const online = await invoke<boolean>("get_engine_status").catch(() => false);
+      if (!online) {
+        markEngineOffline(false);
+        return;
+      }
+      markEngineConnected();
       await bootstrap();
       return;
     }
 
     if (payload.type === "disconnected" || payload.type === "ws_closed") {
-      connection.value = "disconnected";
-      notices.push("warn", "引擎连接断开", "正在尝试自动重连，请检查核心服务状态", {
-        dedupeKey: `disconnected-${Math.floor(Date.now() / 60_000)}`,
-      });
+      // beta9.1：固定 dedupeKey —— 断链后每次重连失败都会重复派发 `ws_closed`。
+      // beta12.1：冷启动 15 秒宽限内只显示「连接中...」，且从未连上过不通知。
+      markEngineOffline(true);
       return;
     }
 
@@ -443,9 +538,17 @@ onMounted(async () => {
               taskName: taskLabel(payload.gid),
             },
           );
+        } else if (!task) {
+          // 第三方 RPC 推送：事件可能先于本地快照到达，单条查询拿不到就整表刷新兜底。
+          await store.refreshNow();
         }
       } catch {
-        // 任务可能已被删除，忽略
+        // 任务可能已被删除，或刚由第三方脚本创建、宿主尚未登记 —— 全量刷新兜底，
+        // 保证「外部推送的任务卡片秒级出现」而不是停在旧列表。
+        await store.refreshNow();
+      } finally {
+        // 新任务通常是 active：事件驱动的刷新必须把进度轮询一并拉起。
+        store.startPolling();
       }
     }
   });
@@ -487,19 +590,48 @@ onMounted(async () => {
           ? `❌ 插件 ${id} 热重载失败：${error ?? "校验未通过"}（已保留旧版本）`
           : `🔄 插件 ${id} 已热重载（${status}）`,
       );
-      notices.push(
-        status === "failed" ? "warn" : "success",
-        status === "failed" ? "插件热重载失败" : "插件已热重载",
+      // beta12.2：后端热重载只记日志，不再推系统通知（避免安装/更新时通知刷屏）。
+      console.info(
         status === "failed"
-          ? `插件 ${id} 重载失败：${error ?? "校验未通过"}，已保留旧版本`
-          : `插件 ${id} 已重新加载（${status}）`,
+          ? `[plugin] ${id} 热重载失败：${error ?? "校验未通过"}（已保留旧版本）`
+          : `[plugin] ${id} 已重新加载（${status}）`,
       );
       if (route.path.startsWith("/plugins")) await pluginsStore.load();
     },
   );
 
+  // beta10：插件接管的虚拟任务（HLS 等）状态增量。
+  unlistenPluginTask = await listen<{ pluginId: string; task: PluginTask }>(
+    "plugin://task",
+    (ev) => {
+      const task = ev.payload.task;
+      if (!task) return;
+      // beta12.2 首帧兜底：非终态事件说明任务刚启动，插件分片的真实下载仍在引擎里，
+      // 立刻拉起轮询让下载页可见（`startPolling` 内部判空，已轮询时幂等）。
+      if (task.phase !== "complete" && task.phase !== "error" && task.phase !== "cancelled") {
+        store.startPolling();
+      }
+      const previous = store.pluginTasks.find((item) => item.id === task.id);
+      store.upsertPluginTask(task);
+      if (previous?.phase === task.phase) return;
+      if (task.phase === "complete") {
+        notices.push("success", "插件任务完成", `${task.title} 已处理完成`, {
+          dedupeKey: `plugin-task-${task.id}`,
+        });
+      } else if (task.phase === "error") {
+        notices.push("error", "插件任务失败", `${task.title}：${task.error || "未知错误"}`, {
+          dedupeKey: `plugin-task-${task.id}-error`,
+        });
+      }
+    },
+  );
+
   const online = await invoke<boolean>("get_engine_status").catch(() => false);
-  connection.value = online ? "connected" : "connecting";
+  if (online) {
+    markEngineConnected();
+  } else {
+    markEngineOffline(false);
+  }
 
   await bootstrap();
 });
@@ -522,6 +654,7 @@ onUnmounted(() => {
   unlistenBreaker?.();
   unlistenReload?.();
   unlistenIntercept?.();
+  unlistenPluginTask?.();
   store.stopPolling();
   system.stopStatPolling();
 });
@@ -547,7 +680,7 @@ onUnmounted(() => {
 
         <main class="workspace">
           <div class="content-card">
-            <div class="page-scroll">
+            <div class="page-scroll" :class="{ 'page-scroll--locked': downloadsPage }">
               <RouterView v-slot="{ Component }">
                 <Transition name="page" mode="out-in">
                   <component :is="Component" />
@@ -561,12 +694,37 @@ onUnmounted(() => {
       <!-- 设置弹窗：常驻渲染，open 控制显示（内容 teleport 到 body）。 -->
       <SettingsView :open="settingsOpen" @close="settingsOpen = false" />
 
+      <!-- 安装安全确认：插件含 exec:local 权限时，装前必须显式信任 -->
+      <div
+        v-if="pluginsStore.consentTarget"
+        class="modal-mask consent-mask"
+        @click.self="resolveExecConsent(false)"
+      >
+        <div class="modal consent-modal" role="alertdialog" aria-modal="true">
+          <header class="modal-head">
+            <h2 class="consent-title">安全警告</h2>
+          </header>
+          <p class="modal-body">
+            此插件包含外部可执行文件，是否信任并安装？
+          </p>
+          <p class="consent-detail">{{ pluginsStore.consentTarget }}</p>
+          <div class="modal-actions">
+            <button class="btn-ghost" @click="resolveExecConsent(false)">取消</button>
+            <button class="consent-accept" @click="resolveExecConsent(true)">
+              信任并安装
+            </button>
+          </div>
+        </div>
+      </div>
+
       <!-- 拖拽遮罩：覆盖整个窗口，提示可投放的内容类型 -->
       <div v-if="dragActive" class="drop-overlay">
         <div class="drop-frame">
           <AppIcon name="download" :size="38" />
-          <p class="drop-title">松开以添加下载任务</p>
-          <p class="drop-hint">支持 http / https / magnet 链接与 .torrent 种子文件</p>
+          <p class="drop-title">松开以添加下载任务 / 安装插件</p>
+          <p class="drop-hint">
+            支持 http / https / magnet 链接、.torrent 种子与 .zip 插件包（或插件文件夹）
+          </p>
         </div>
       </div>
       </div>
@@ -622,6 +780,97 @@ onUnmounted(() => {
   /* 顶部不留内边距：sticky 标题栏的布局位 = 视觉位，滚动到顶时内容不会钻到标题背后。 */
   padding: 0 30px 32px;
   scroll-behavior: smooth;
+}
+
+/* beta9：下载页锁死外层高度，只让内部虚拟列表滚动，消除第二条滚动条。 */
+.page-scroll--locked {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+/* ---- 安装安全确认弹窗 ---- */
+/* z-index 高于普通弹窗（1000）与拖拽遮罩（3000）：这是阻断式安全询问。 */
+.modal-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 3200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(40, 12, 12, 0.4);
+  backdrop-filter: blur(2px);
+}
+
+.modal {
+  width: min(460px, 100%);
+  padding: 20px 22px;
+  border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--line));
+  border-radius: 12px;
+  background: var(--surface);
+  box-shadow: var(--shadow-float);
+}
+
+.modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.consent-title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--danger);
+}
+
+.modal-body {
+  margin: 10px 0 8px;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.6;
+  color: var(--text);
+}
+
+.consent-detail {
+  margin: 0;
+  padding: 9px 12px;
+  border-left: 3px solid var(--danger);
+  border-radius: 8px;
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-size: 12.5px;
+  line-height: 1.6;
+  word-break: break-all;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.modal-actions button {
+  height: 36px;
+  padding: 0 16px;
+  border-radius: var(--r-btn);
+}
+
+/* 主操作是「信任并安装」，用危险色强化风险感知。 */
+.consent-accept {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #ffffff;
+  font-weight: 600;
+}
+.consent-accept:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--danger) 82%, #000000);
+  border-color: color-mix(in srgb, var(--danger) 82%, #000000);
+  color: #ffffff;
 }
 
 /* ---- 拖拽遮罩 ---- */

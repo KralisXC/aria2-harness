@@ -1,5 +1,7 @@
 ﻿pub mod metrics;
 mod plugin;
+// beta10：内部任务 gid 注册表（tracker 自拉 + 插件分片任务共用）。
+pub(crate) mod internal_gids;
 // 增量 51：并发自动降级（403/429 等拒绝类错误按档位重试）。
 mod degradation;
 // 增量 27（P2-A）：全局错误模型。UI bin（`main.rs`）与核心服务 bin
@@ -55,6 +57,12 @@ use service_protocol::ServiceRequest;
 
 // 插件列表视图类型对外可见（`list_plugins` 的返回类型，供 IPC 路由序列化）。
 pub use plugin::manager::PluginInfo;
+// beta12.2：共享组件视图（`list_shared_plugins` 的返回类型）。
+pub use plugin::manager::SharedInfo;
+// beta10：虚拟任务视图（插件接管的下载）。
+pub use plugin::plugin_tasks::PluginTask;
+// beta11：插件日志条目视图（`get_plugin_logs` 的返回类型）。
+pub use plugin::logs::PluginLogEntry;
 
 /// aria2 RPC 监听端口。核心服务启动引擎时由 UI 通过命名管道下发该端口。
 pub const RPC_PORT: &str = "6800";
@@ -70,6 +78,12 @@ const INTERCEPT_TIMEOUT: Duration = Duration::from_secs(3);
 const EVENT_THROTTLE: Duration = Duration::from_millis(500);
 /// 单次任务状态查询（`tellStatus` / `tellStopped`）的上界：引擎挂死时不能让落库任务悬着。
 const RECORD_TIMEOUT: Duration = Duration::from_secs(5);
+/// beta9.1：引擎健康探针（`aria2.getVersion`）的超时。
+///
+/// 判定原则：WS 握手成功 ≠ 引擎可用。服务进程被强杀 / 内部 aria2 卡死时，
+/// 回环 TCP 仍可能握手成功，只有真正收到 RPC 回执才算"运行正常"。
+/// 3s 对本地回环足够宽松，超时即视为不健康。
+const ENGINE_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 /// 与核心服务做启动握手的最大尝试次数。
 /// 用户裁决红线：连不上**绝不崩溃、绝不死循环** —— 有限次退避重试后停在"未就绪"态并向前端报错。
 const SERVICE_HANDSHAKE_ATTEMPTS: usize = 5;
@@ -91,7 +105,7 @@ pub fn session_path() -> std::path::PathBuf {
 
 /// tellActive / tellWaiting / tellStopped 请求的字段白名单，作为前后端的数据契约。
 /// 插件系统的 ctx.getTask / getTasks 复用同一份白名单。
-pub(crate) const TASK_KEYS: [&str; 13] = [
+pub(crate) const TASK_KEYS: [&str; 14] = [
     "gid",
     "status",
     "totalLength",
@@ -106,6 +120,8 @@ pub(crate) const TASK_KEYS: [&str; 13] = [
     "pieceProgress",
     "activeWorkers",
     "eta",
+    // beta8.3：403/429 限流降级暂停的原因（实时状态，不落库）。
+    "pauseReason",
 ];
 
 /// 全局共享状态：WebSocket RPC 客户端 + 核心服务回传的 RPC 密钥 + 服务未就绪原因。
@@ -205,6 +221,14 @@ pub(crate) fn plugins() -> &'static plugin::PluginManager {
     PLUGINS
         .get()
         .expect("PluginManager 尚未初始化（应先调用 bootstrap）")
+}
+
+/// 插件管理器单例的**非 panic**访问器。
+///
+/// beta12 · 模块 E：本机 HTTP `/probe`、`/check` 可能在 bootstrap 完成前到达，
+/// 这里返回 `None` 让调用方回 `503 inactive`，绝不 panic 拖垮 Host 进程。
+pub(crate) fn plugins_opt() -> Option<&'static plugin::PluginManager> {
+    PLUGINS.get()
 }
 
 /// 任务历史数据库句柄；不可用（启动时打开/迁移失败）时返回 `None`，调用方自行降级。
@@ -727,17 +751,55 @@ async fn run_ws_loop(secret: String) {
         if let Some(received) = received {
             match received {
                 Ok(Notification::WebSocketConnected) => {
-                    pending.push(Notification::WebSocketConnected);
-                    // 引擎若被服务重新拉起，`rpc-secret` 会轮换：每次连上后都重新对齐，
-                    // 否则后续调用会持续 `Unauthorized`（E2E 强杀引擎实测）。fire-and-forget，
-                    // 绝不阻塞通知循环。
+                    // beta9.1：WS 握手成功 ≠ 引擎可用。先发一次 `aria2.getVersion`
+                    // 健康探针，只有拿到正常回执才向前端报 `connected`；否则立即
+                    // 报 `disconnected` 并踢掉这条"假连接"，避免顶栏假绿。
                     //
-                    // 对齐后立即把 config.json 里的全局设置重放给引擎：覆盖安装 / 引擎重启
-                    // 会丢失 `changeGlobalOption` 的运行时值（下载目录、限速、代理等）。
-                    let restore_client = client.clone();
+                    // 探针前必须先对齐 `rpc-secret`：引擎被拉起后密钥会轮换，旧密钥
+                    // 会让探针拿到 `Unauthorized` 而误判"引擎没起来"（E2E 实测）。
+                    let probe_client = client.clone();
                     rt().spawn(async move {
-                        resync_secret(restore_client.clone()).await;
-                        apply_saved_globals(&restore_client).await;
+                        // 对齐密钥设 2s 上界：服务若半死，不能让探针被这条辅助链路
+                        // 拖住（探针本身 3s 超时，合起来仍能及时判定未连接）。
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(2),
+                            resync_secret(probe_client.clone()),
+                        )
+                        .await;
+                        match tokio::time::timeout(
+                            ENGINE_PROBE_TIMEOUT,
+                            probe_client.call("aria2.getVersion", Vec::new()),
+                        )
+                        .await
+                        {
+                            Ok(Ok(_)) => {
+                                // 探针通过 = 服务已真正恢复：清掉上一次拉起失败的残留原因，
+                                // 否则 `client_or_err` 会继续对所有命令抛 SERVICE_UNAVAILABLE。
+                                if let Ok(mut guard) = state().service_error.lock() {
+                                    *guard = None;
+                                }
+                                emit(EVENT_NAME, json!({ "type": "connected" }));
+                                // 探针通过后再重放 config.json 的全局设置：覆盖安装 /
+                                // 引擎重启会丢失 `changeGlobalOption` 的运行时值
+                                // （下载目录、限速、代理等）。
+                                apply_saved_globals(&probe_client).await;
+                            }
+                            Ok(Err(err)) => {
+                                tracing::warn!(
+                                    "[service] WS 已握手但 getVersion 失败（{err}），判定未连接"
+                                );
+                                emit(EVENT_NAME, json!({ "type": "disconnected" }));
+                                probe_client.force_disconnect();
+                            }
+                            Err(_) => {
+                                tracing::warn!(
+                                    "[service] WS 已握手但 getVersion 超时（{}s），判定未连接",
+                                    ENGINE_PROBE_TIMEOUT.as_secs()
+                                );
+                                emit(EVENT_NAME, json!({ "type": "disconnected" }));
+                                probe_client.force_disconnect();
+                            }
+                        }
                     });
                     // 增量 28：首次连通即与 aria2 对账，补齐"UI 未运行期间自行下完"的记录。
                     // 用 `swap` 保证只跑一次：引擎抖动会反复重连，不能每次都全量写库。
@@ -989,6 +1051,19 @@ fn read_host_config() -> Map<String, Value> {
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
         .and_then(|value| value.as_object().cloned())
         .unwrap_or_default()
+}
+
+/// 读取用户保存的 RPC 密钥（`config.json` 的 `rpc_secret`）。
+///
+/// 服务启动时优先使用它，保证「UI 里看到并保存过的密钥」在重启后仍然生效；
+/// 从未保存过则返回 `None`，由服务生成一次性随机密钥。
+pub fn configured_rpc_secret() -> Option<String> {
+    read_host_config()
+        .get("rpc_secret")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 /// 布尔配置项读取，缺省值由调用方给出。
@@ -1288,18 +1363,31 @@ async fn global_referer_present(client: &Client) -> bool {
 
 /// 添加一个下载任务，返回 aria2 分配的 GID。
 ///
+/// `urls` 支持多 URI（互为镜像）：同批次共用同一份 Header 与落盘路径，
+/// 由引擎逐个尝试，前一个失败自动换下一个。
+///
 /// 目录解析放在 Rust 端：前端未传（`None`）或传空串时回退到默认下载目录，
 /// 并在下发前用 `create_dir_all` 确保目录真实存在，避免 aria2c 因目录缺失而报错。
-#[tracing::instrument(skip_all, fields(url = %url, dir = ?dir))]
+#[tracing::instrument(skip_all, fields(urls = ?urls, dir = ?dir))]
 pub async fn add_download(
-    url: String,
+    urls: Vec<String>,
     dir: Option<String>,
     extra_options: Option<Map<String, Value>>,
 ) -> Result<String, AppError> {
     let client = client_or_err(state()).await?;
 
-    // 微内核前置拦截：把原始 URL 交给插件总线改写（宿主不含任何站点解析逻辑）。
-    let url = intercept_url(url).await;
+    // 清洗：去首尾空白、丢空行、保序去重。前端已做一次，宿主再做一次是因为
+    // 浏览器扩展 / 未来的 CLI 也可能直接走 IPC。
+    let mut cleaned: Vec<String> = urls
+        .into_iter()
+        .map(|url| url.trim().to_string())
+        .filter(|url| !url.is_empty())
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    cleaned.retain(|url| seen.insert(url.clone()));
+    if cleaned.is_empty() {
+        return Err(AppError::InvalidArgs("下载地址不能为空".to_string()));
+    }
 
     // 前端未传、传空、传相对路径或历史遗留的 systemprofile 路径时，强制兜底到
     // 当前用户的系统「下载」文件夹。相对路径在 LocalSystem 下会解析到 System32。
@@ -1309,9 +1397,67 @@ pub async fn add_download(
     std::fs::create_dir_all(&target_dir)
         .map_err(|e| AppError::fs(format!("创建下载目录失败（{target_dir}）"), e))?;
 
+    // beta10：先问 TaskRouter「这个 URL 是否由插件接管」。
+    // claim 成功则整个下载生命周期交给插件（不再产生 aria2 任务），并返回虚拟任务 id；
+    // 未命中 / claim:false / 超时则回到既有「前置拦截 → 6800 路由」链路。
+    let claim_options = extra_options
+        .as_ref()
+        .map(|map| Value::Object(map.clone()))
+        .unwrap_or(Value::Null);
+
+    // 微内核前置拦截：把原始 URL 交给插件总线改写（宿主不含任何站点解析逻辑）。
+    // 多镜像逐条改写：插件按站点匹配，不能假设镜像都命中同一规则。
+    let mut urls = Vec::with_capacity(cleaned.len());
+    for url in cleaned {
+        let detect_url = url.clone();
+        let detect_options = claim_options.clone();
+        // 认领是同步等待（最长 3s）：放进阻塞池，避免占住 tokio worker。
+        let claim = tokio::task::spawn_blocking(move || {
+            plugins().claim_task(&detect_url, &detect_options)
+        })
+        .await
+        .ok()
+        .flatten();
+
+        if let Some(claim) = claim {
+            // beta10：插件沙箱默认只允许写系统「下载」文件夹；用户自定义任务目录
+            // 必须先登记为额外允许根，否则插件建临时目录会「路径越权」。
+            plugin::hostapi::allow_extra_root(&target_dir);
+            let task = plugin::plugin_tasks::create(&claim.plugin_id, &claim.title, &url);
+            let payload = json!({
+                "hook": "onTaskRun",
+                "task": {
+                    "id": task.id.clone(),
+                    "title": task.title.clone(),
+                    "url": url.clone(),
+                    "dir": target_dir.clone(),
+                    "outputDir": target_dir.clone(),
+                    "options": claim_options,
+                }
+            });
+            if let Err(e) = plugins().run_plugin_task(&claim.plugin_id, "onTaskRun", payload) {
+                // 已认领但投递失败：把虚拟任务标成错误并返回 id，让前端能看到原因。
+                let _ = plugin::plugin_tasks::apply_event(
+                    &claim.plugin_id,
+                    &json!({ "id": task.id, "phase": "error", "error": e.to_string() }),
+                );
+            } else {
+                println!(
+                    "[plugin:{}] 已接管下载任务 {}（虚拟任务 {}）",
+                    claim.plugin_id, url, task.id
+                );
+            }
+            return Ok(task.id);
+        }
+
+        urls.push(intercept_url(url).await);
+    }
+    // 首个 URI 代表整单：自动 Referer / 兼容规则 / 历史记录都以它为准。
+    let first_url = urls[0].clone();
+
     // 增量 28：`url` 与 `target_dir` 会被下面的 RPC 参数取走，先各留一份给落库
     //（此时它们是本地已知量，不需要额外查询即可建立历史行）。
-    let url_for_db = url.clone();
+    let url_for_db = first_url.clone();
     let dir_for_db = target_dir.clone();
 
     // 选项直接以 kebab-case 键值对下发（`dir`），无需中间结构体。
@@ -1337,12 +1483,12 @@ pub async fn add_download(
     // 2. 设置页的全局自定义 Referer —— 由引擎全局选项承接，注入前先探测；
     // 3. 内置规则猜测 —— 仅在以上都没有时兜底。
     if !options.contains_key("referer") && auto_referer_enabled() {
-        if let Some(referer) = guess_referer(&url) {
+        if let Some(referer) = guess_referer(&first_url) {
             if !global_referer_present(&client).await {
                 options.insert("referer".to_string(), json!(referer));
                 tracing::info!(
                     "[download] 已自动为 {} 注入 Referer: {}",
-                    url_host(&url),
+                    url_host(&first_url),
                     referer
                 );
             }
@@ -1352,7 +1498,7 @@ pub async fn add_download(
     // HTTP/1.1 兼容：全局开关命中，或目标属于已知的老旧 CDN（腾讯 gtimg）。
     // 后者同时降为单连接 —— 老旧 CDN 对大分片 Range 的边界处理经常有 bug，
     // 多连接会把"能下的文件"切成"必 403 的请求"。
-    let legacy_cdn = is_legacy_cdn(&url);
+    let legacy_cdn = is_legacy_cdn(&first_url);
     if !options.contains_key("enable-http2") && (http1_compat_enabled() || legacy_cdn) {
         options.insert("enable-http2".to_string(), json!("false"));
         if !legacy_cdn {
@@ -1366,13 +1512,13 @@ pub async fn add_download(
         options.insert("max-connection-per-server".to_string(), json!("1"));
         tracing::info!(
             "[download] {} 命中老旧 CDN 兼容规则：已强制 HTTP/1.1 + 单连接",
-            url_host(&url)
+            url_host(&first_url)
         );
     }
 
     metrics::METRICS.rpc_calls.fetch_add(1, Ordering::Relaxed);
     let retry_options = options.clone();
-    let gid = rpc_bounded("addUri", client.add_uri(vec![url], options)).await?;
+    let gid = rpc_bounded("addUri", client.add_uri(urls, options)).await?;
     // 增量 51：登记并发档位，供 onDownloadError 时自动降级重试。
     degradation::register(&gid, &url_for_db, &dir_for_db, &retry_options);
     // 记下"被动降级"的任务：前端据此显示 [单线程降级] 标签。
@@ -1882,12 +2028,94 @@ where
     }
 }
 
-/// 查询当前引擎（WS RPC）是否已连接。
+/// 查询引擎是否**真正可用**（beta9.1）。
 ///
-/// 前端 `onMounted` 主动调用一次以对齐初始状态：`connected`/`ws_connected` 事件可能在
-/// 前端注册监听器**之前**就已被发射（时序竞争），仅依赖事件会让 UI 长期停留在"连接中"。
+/// 旧实现只看 `state().client.is_some()`：客户端对象在 bootstrap 时就已创建且永不销毁，
+/// 服务进程被强杀后仍返回 `true`，导致顶栏假绿、重连按钮提前消失。现在必须：
+/// 1. 客户端存在且 WS 处于已连接状态；
+/// 2. 在 [`ENGINE_PROBE_TIMEOUT`] 内收到 `aria2.getVersion` 的正常回执。
+/// 任一不满足即返回 `false`，前端保持「未连接」并继续显示「重新连接」。
 pub async fn get_engine_status() -> Result<bool, AppError> {
-    Ok(state().client.lock().await.is_some())
+    let client = state().client.lock().await.clone();
+    let Some(client) = client else {
+        return Ok(false);
+    };
+    if !client.is_connected() {
+        return Ok(false);
+    }
+    let probe = client.call("aria2.getVersion", Vec::new());
+    match tokio::time::timeout(ENGINE_PROBE_TIMEOUT, probe).await {
+        Ok(Ok(_)) => Ok(true),
+        Ok(Err(err)) => {
+            tracing::warn!("[service] getVersion 探针失败：{err}");
+            Ok(false)
+        }
+        Err(_) => {
+            tracing::warn!(
+                "[service] getVersion 探针超时（{}s），判定引擎未就绪",
+                ENGINE_PROBE_TIMEOUT.as_secs()
+            );
+            Ok(false)
+        }
+    }
+}
+
+/// 读取当前生效的 RPC 密钥（服务端真值，不是 `config.json` 的回显）。
+///
+/// UI 只在设置页展示；密钥本身由核心服务生成 / 沿用，宿主只做镜像。
+pub fn get_rpc_secret() -> String {
+    state()
+        .secret
+        .lock()
+        .map(|secret| secret.clone())
+        .unwrap_or_default()
+}
+
+/// 修改 RPC 密钥：先让核心服务原地热更新，成功后再落盘并同步本机客户端。
+///
+/// 顺序很关键：服务拒绝（例如回滚档 `--engine=aria2`）时**不落盘、不改内存**，
+/// 避免出现「UI 显示新密钥、引擎仍用旧密钥」的错位状态。
+pub async fn set_rpc_secret(secret: String) -> Result<(), AppError> {
+    let secret = secret.trim().to_string();
+    let length = secret.chars().count();
+    if !(8..=128).contains(&length) {
+        return Err(AppError::InvalidArgs(
+            "RPC 密钥长度需为 8–128 个字符".to_string(),
+        ));
+    }
+    if secret.chars().any(char::is_whitespace) {
+        return Err(AppError::InvalidArgs(
+            "RPC 密钥不能包含空格等空白字符".to_string(),
+        ));
+    }
+
+    match service_client::request(&ServiceRequest::SetSecret {
+        secret: secret.clone(),
+    })
+    .await
+    {
+        Ok(resp) if resp.ok => {}
+        Ok(resp) => {
+            return Err(AppError::Internal(
+                resp.error
+                    .unwrap_or_else(|| "核心服务拒绝修改 RPC 密钥".to_string()),
+            ));
+        }
+        Err(err) => return Err(err),
+    }
+
+    let mut patch = Map::new();
+    patch.insert("rpc_secret".to_string(), json!(secret));
+    set_host_config(patch)?;
+
+    if let Ok(mut guard) = state().secret.lock() {
+        *guard = secret.clone();
+    }
+    // 同一个 WS 客户端仍在用旧 token：不同步的话下一条 RPC 立刻 Unauthorized。
+    if let Some(client) = state().client.lock().await.as_ref() {
+        client.update_secret(secret);
+    }
+    Ok(())
 }
 
 /// 立即触发一次引擎重连（窗口回到前台时调用）。
@@ -1904,6 +2132,115 @@ pub async fn reconnect_engine() -> Result<bool, AppError> {
         client.reconnect_now();
     }
     Ok(connected)
+}
+
+/// beta9：顶栏「重新连接」——服务被强杀后由用户主动恢复。
+///
+/// 与 [`reconnect_engine`] 的区别：后者只在 client 已存在时打断退避，**不会拉起
+/// 已经退出的 aria2-service.exe**；本函数先重新握手，必要时复用 bootstrap 的
+/// SCM → 计划任务 → UAC 链路把服务拉起来，再重建 WS 连接。
+///
+/// beta9.1：拉起进程 / 管道握手成功**都不等于服务可用**（UAC 被拒、安全软件拦截、
+/// 进程秒退时管道可能短暂可达）。成功判据改为 [`wait_engine_ready`] —— 必须在
+/// `READY_TIMEOUT` 内通过真实 `aria2.getVersion` 探针；否则返回明确失败原因，
+/// 前端据此弹窗并保持「重新连接」可见。
+pub async fn restart_service() -> Result<bool, AppError> {
+    const RESTART_ATTEMPTS: usize = 3;
+    const RESTART_BACKOFF: Duration = Duration::from_millis(600);
+    const READY_TIMEOUT: Duration = Duration::from_secs(12);
+
+    let port: u16 = RPC_PORT.parse().unwrap_or(6800);
+    let mut last_err = String::new();
+
+    for attempt in 1..=RESTART_ATTEMPTS {
+        match service_client::request(&ServiceRequest::StartEngine { port }).await {
+            Ok(resp) if resp.ok => {
+                let secret = resp.rpc_secret.clone().unwrap_or_default();
+                if secret.is_empty() {
+                    last_err = "核心服务未回传 rpc-secret".to_string();
+                } else {
+                    if let Ok(mut guard) = state().service_error.lock() {
+                        *guard = None;
+                    }
+                    if let Ok(mut guard) = state().secret.lock() {
+                        *guard = secret.clone();
+                    }
+                    // 已有 client：换密钥并立即打断指数退避；
+                    // 尚无 client（首次 bootstrap 就失败）：重新铺一遍 WS 事件通道。
+                    let has_client = state().client.lock().await.is_some();
+                    if has_client {
+                        if let Some(client) = state().client.lock().await.as_ref() {
+                            client.update_secret(secret);
+                            client.reconnect_now();
+                        }
+                    } else {
+                        rt().spawn(run_ws_loop(secret));
+                    }
+                    // beta9.1：管道握手成功只是"服务进程在应答"，必须再用真实 RPC
+                    // 探针确认引擎就绪，否则 UAC 拒绝 / 进程秒退时前端会假绿。
+                    if wait_engine_ready(READY_TIMEOUT).await {
+                        tracing::info!("[service] 用户触发的重连已完成，引擎已通过健康探针");
+                        return Ok(true);
+                    }
+                    last_err = format!(
+                        "服务进程已拉起，但引擎 RPC 在 {}s 内未就绪",
+                        READY_TIMEOUT.as_secs()
+                    );
+                }
+            }
+            Ok(resp) => {
+                last_err = resp
+                    .error
+                    .unwrap_or_else(|| "核心服务返回未知错误".to_string());
+            }
+            Err(err) => {
+                last_err = err.to_string();
+                // 管道不通 = 服务进程不在：与 bootstrap 相同的三保险拉起。
+                // Debug 期由开发脚本负责启动，不在这里弹 UAC。
+                #[cfg(all(windows, not(debug_assertions)))]
+                if attempt == 1 {
+                    if start_service_from_scm() {
+                        tracing::info!("[service] 重连：已通过 SCM 拉起核心服务");
+                        tokio::time::sleep(SERVICE_HANDSHAKE_BACKOFF).await;
+                    } else if start_service_from_task() {
+                        tracing::info!("[service] 重连：已通过计划任务拉起核心服务");
+                        tokio::time::sleep(SERVICE_HANDSHAKE_BACKOFF).await;
+                    } else if let Err(spawn_err) = spawn_service_elevated() {
+                        last_err = spawn_err.to_string();
+                    }
+                }
+            }
+        }
+        if attempt < RESTART_ATTEMPTS {
+            tokio::time::sleep(RESTART_BACKOFF).await;
+        }
+    }
+
+    let message = format!(
+        "无法重新拉起后台服务，请尝试以管理员身份重启软件或检查安全软件拦截（{last_err}）"
+    );
+    if let Ok(mut guard) = state().service_error.lock() {
+        *guard = Some(message.clone());
+    }
+    tracing::warn!("[service] {message}");
+    Err(AppError::Service(message))
+}
+
+/// beta9.1：轮询 [`get_engine_status`] 直到引擎真正就绪或超时。
+///
+/// 500ms 一次的纯探针（`aria2.getVersion`）：只在用户主动点「重新连接」时调用，
+/// 频度可控；判据与前端顶栏完全一致，避免"宿主说好了、前端却仍是红的"。
+async fn wait_engine_ready(total: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + total;
+    loop {
+        if let Ok(true) = get_engine_status().await {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 /// 代理连通性测试（设置 → 网络）：对 `host:port` 做一次 TCP 握手，返回耗时毫秒。
@@ -1981,6 +2318,123 @@ pub fn list_plugins() -> Vec<PluginInfo> {
     plugins().list()
 }
 
+/// beta12.2：共享组件列表（`data/plugins/.shared/*`，仅供 UI 展示 / 卸载）。
+pub fn list_shared_plugins() -> Vec<SharedInfo> {
+    plugins().list_shared()
+}
+
+/// beta10：插件接管的虚拟任务列表（HLS 等）。
+pub fn list_plugin_tasks() -> Vec<PluginTask> {
+    plugin::plugin_tasks::list()
+}
+
+/// beta10：取消一个虚拟任务（中断分片批量下载，并通知插件清理临时文件）。
+///
+/// beta12.1：除置位取消令牌 + 强杀 FFmpeg 外，还会把该插件**正在运行的分片 gid**
+/// 逐个 `forceRemove` —— 否则插件线程虽已收敛，aria2 仍在后台把剩余分片下完。
+pub async fn cancel_plugin_task(task_id: String) -> Result<(), AppError> {
+    let task = plugins().cancel_plugin_task(&task_id)?;
+    let gids = plugin::tasks::take_active_gids(&task.plugin_id);
+    if gids.is_empty() {
+        return Ok(());
+    }
+    let client = client_or_err(state()).await?;
+    for gid in gids {
+        metrics::METRICS.rpc_calls.fetch_add(1, Ordering::Relaxed);
+        let _ = rpc_bounded("forceRemove", client.force_remove(&gid)).await;
+        let _ = rpc_bounded("removeDownloadResult", client.remove_download_result(&gid)).await;
+        internal_gids::unmark_internal(&gid);
+    }
+    Ok(())
+}
+
+/// beta10.1：从前端列表移除一条已结束的虚拟任务（宿主注册表同步删除）。
+///
+/// beta12.1：运行中的任务先走一遍取消链路，避免「点删除后仍在后台偷跑」。
+/// beta12.3：`with_files == true` 时级联清理任务产物（合并后的 MP4）与分片临时目录；
+/// 路径必须严格落在全局下载目录内，越权路径只记日志、不阻断删除。
+pub async fn remove_plugin_task(task_id: String, with_files: bool) -> Result<(), AppError> {
+    // 先取快照（删除后注册表里就查不到了）。
+    let snapshot = plugin::plugin_tasks::get(&task_id);
+    if let Some(task) = &snapshot {
+        let running = !matches!(
+            task.phase.as_str(),
+            "complete" | "error" | "cancelled"
+        );
+        if running {
+            let _ = cancel_plugin_task(task_id.clone()).await;
+        }
+    }
+    plugin::plugin_tasks::remove(&task_id);
+    // 清理放在注册表移除之后：即使文件清理失败，任务卡片也必须消失。
+    if with_files {
+        if let Some(task) = snapshot {
+            let root = configured_download_dir();
+            remove_task_artifacts(
+                &root,
+                task.output_path.as_deref(),
+                task.temp_dir.as_deref(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// beta12.3：删除插件任务的产物文件与临时目录（`remove_plugin_task` 的落盘部分）。
+///
+/// 安全：两个路径都必须严格落在 `root` 之内（词法归一 + 真实路径复核），
+/// 越权一律拒绝并记日志（见 [`plugin::hostapi::guarded_download_path`]）；
+/// 删除失败同样只记日志，绝不阻断任务卡片移除。
+fn remove_task_artifacts(root: &Path, output_path: Option<&str>, temp_dir: Option<&str>) {
+    for (label, candidate) in [("输出文件", output_path), ("临时目录", temp_dir)] {
+        let Some(raw) = candidate.map(str::trim).filter(|text| !text.is_empty()) else {
+            continue;
+        };
+        let Some(path) = plugin::hostapi::guarded_download_path(root, raw) else {
+            tracing::warn!("[plugin-task] 拒绝清理越权路径（{label}）：{raw}");
+            continue;
+        };
+        let removed = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else if path.is_file() {
+            std::fs::remove_file(&path)
+        } else {
+            // 已不存在：无需清理（不是错误）。
+            continue;
+        };
+        match removed {
+            Ok(()) => tracing::info!("[plugin-task] 已清理{label}：{}", path.display()),
+            Err(e) => tracing::warn!(
+                "[plugin-task] 清理{label}失败（{}）：{e}",
+                path.display()
+            ),
+        }
+    }
+}
+
+/// beta10.1：安装拖入的 `.zip` 插件包（base64 内容）。
+///
+/// 解压 → 结构与字段校验 → 落盘 → QuickJS 预加载；任一环节失败都会清理
+/// 临时/新目录，并向前端返回可读错误。只有全部通过才返回安装结果。
+///
+/// 1.0.0-rc1：`allow_exec_local` 为用户安全确认结果 —— 包内申请 `exec:local`
+/// 且未确认时返回 `PLUGIN_CONSENT_REQUIRED`，此时未移动任何目录。
+pub fn install_plugin_zip(data: String, allow_exec_local: bool) -> Result<Value, AppError> {
+    let bytes = plugin::install::decode_base64(&data)?;
+    let outcome = plugin::install::install_zip(plugins(), &bytes, allow_exec_local)?;
+    Ok(json!(outcome))
+}
+
+/// beta10.1：安装拖入的插件文件夹（逐文件 base64 内容）。
+///
+/// `files` 为 `[{ path, data }]`，`path` 是相对文件夹根的路径。校验与回滚语义
+/// 与 [`install_plugin_zip`] 完全一致。
+pub fn install_plugin_dir(files: Value, allow_exec_local: bool) -> Result<Value, AppError> {
+    let files: Vec<plugin::install::InstallFile> = serde_json::from_value(files)?;
+    let outcome = plugin::install::install_files(plugins(), files, allow_exec_local)?;
+    Ok(json!(outcome))
+}
+
 /// 启用/禁用指定插件。
 ///
 /// 禁用为**挂起**语义：插件线程与 QuickJS 运行时仍存活，但 HookDispatcher 不再向其派发事件，
@@ -1999,12 +2453,54 @@ pub fn grant_plugin_permissions(id: String) -> Result<(), AppError> {
 
 /// 保存插件设置（JSON Schema 表单提交）。
 ///
-/// 校验、持久化（registry.json）与运行时热更新统一由 `PluginManager` 完成；
-/// `ctx.settings.get()` 在下一次 hook 调用时即可读到新值，无需重载插件。
+/// 校验、持久化（`data/plugins/configs/<id>.json`）与运行时热更新统一由
+/// `PluginManager` 完成；`ctx.settings.get()` 在下一次 hook 调用时即可读到新值，
+/// 无需重载插件。
 pub fn update_plugin_settings(id: String, values: Map<String, Value>) -> Result<(), AppError> {
     plugins()
         .update_settings(&id, values.into_iter().collect())
         .map_err(AppError::from)
+}
+
+/// beta11 · B5：读取插件日志（环形缓冲快照，按时间正序）。
+///
+/// `limit` 缺省 / 0 表示取全部（最多 500 条）；前端日志控制台打开时用 500 回填。
+pub fn get_plugin_logs(id: String, limit: usize) -> Vec<PluginLogEntry> {
+    plugin::logs::snapshot(&id, limit)
+}
+
+/// beta11 · B5：清空插件日志（前端「清空日志」按钮）。
+pub fn clear_plugin_logs(id: String) {
+    plugin::logs::clear(&id);
+}
+
+/// beta11 · B13/B14：卸载插件（删目录 + 删配置 + 清授权账本）。
+pub fn uninstall_plugin(id: String) -> Result<(), AppError> {
+    plugins().uninstall(&id).map_err(AppError::from)
+}
+
+/// beta12.2：卸载共享组件（删 `.shared/<id>` 目录，不触碰普通插件）。
+pub fn uninstall_shared_plugin(id: String) -> Result<(), AppError> {
+    plugins().uninstall_shared(&id).map_err(AppError::from)
+}
+
+/// beta11 · FF-5：把「右键插件动作」派发给插件的 `onAction` hook。
+///
+/// `task` 由前端从已完成任务构造（`{ gid, name, path, dir }`），原样透传；
+/// 派发复用既有长任务通道（`limits.taskTimeoutMs` 预算 + 熔断计数）。
+pub fn run_plugin_action(
+    plugin_id: String,
+    action_id: String,
+    task: Value,
+) -> Result<(), AppError> {
+    if action_id.trim().is_empty() {
+        return Err(AppError::InvalidArgs("actionId 不能为空".to_string()));
+    }
+    plugins().run_plugin_task(
+        &plugin_id,
+        "onAction",
+        json!({ "hook": "onAction", "action": action_id, "task": task }),
+    )
 }
 
 /// 在系统文件管理器中定位文件（替代 `@tauri-apps/plugin-opener` 的 `revealItemInDir`）。
@@ -2533,7 +3029,7 @@ pub fn shutdown() {
 
 #[cfg(test)]
 mod tests {
-    use super::{base64_encode, last_path_segment};
+    use super::{base64_encode, last_path_segment, remove_task_artifacts};
 
     /// RFC 4648 标准向量：覆盖 1/2/3 字节（含 `=` 与 `==` 两种填充）。
     #[test]
@@ -2552,8 +3048,36 @@ mod tests {
     fn last_segment_handles_both_separators() {
         assert_eq!(last_path_segment(r"C:\downloads\a.zip").as_deref(), Some("a.zip"));
         assert_eq!(last_path_segment("/tmp/a.zip").as_deref(), Some("a.zip"));
-        assert_eq!(last_path_segment(r"E:\mixed/a.zip").as_deref(), Some("a.zip"));
+        assert_eq!(last_path_segment(r"C:\mixed/a.zip").as_deref(), Some("a.zip"));
         assert_eq!(last_path_segment(""), None);
         assert_eq!(last_path_segment(r"C:\downloads\"), Some("downloads".to_string()));
+    }
+
+    /// beta12.3：删除插件任务产物 —— 合法 output / temp 被删除，越界路径绝不删除。
+    #[test]
+    fn remove_task_artifacts_only_deletes_inside_download_root() {
+        let root = tempfile::tempdir().unwrap();
+        let task_dir = root.path().join("hls").join("task-1");
+        std::fs::create_dir_all(&task_dir).unwrap();
+        let output = task_dir.join("out.mp4");
+        std::fs::write(&output, b"x").unwrap();
+        let temp = root.path().join(".harness-plugin").join("task-1");
+        std::fs::create_dir_all(&temp).unwrap();
+        std::fs::write(temp.join("0.ts"), b"x").unwrap();
+
+        remove_task_artifacts(
+            root.path(),
+            Some(output.to_str().unwrap()),
+            Some(temp.to_str().unwrap()),
+        );
+        assert!(!output.exists(), "合法的合并输出必须被删除");
+        assert!(!temp.exists(), "合法的临时目录必须被删除");
+
+        // 越界路径（另一棵目录树）必须原样保留。
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("keep.mp4");
+        std::fs::write(&outside_file, b"x").unwrap();
+        remove_task_artifacts(root.path(), Some(outside_file.to_str().unwrap()), Some("../keep.mp4"));
+        assert!(outside_file.exists(), "下载根之外的路径必须保留");
     }
 }

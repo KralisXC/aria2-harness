@@ -1,7 +1,7 @@
 {
   "name": "aria2-harness",
   "private": true,
-  "version": "1.0.0-beta8",
+  "version": "1.0.0-rc1",
   "author": "lingxi",
   "type": "module",
   "scripts": {

@@ -2,4 +2,5 @@
 
 pub mod cancel;
 pub mod event;
+pub mod naming;
 pub mod registry;

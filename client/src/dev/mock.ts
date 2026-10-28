@@ -297,7 +297,10 @@ export async function mockInvoke<T>(
       return clone(findTask(gid) ?? tasks[0]) as T;
     }
     case "add_download": {
-      const url = String(args?.url ?? "");
+      const urls = Array.isArray(args?.urls)
+        ? (args.urls as unknown[]).map((item) => String(item ?? "")).filter(Boolean)
+        : [];
+      const url = urls[0] ?? "";
       const gid = Math.random().toString(16).slice(2, 14);
       const name = url.split("/").pop() || "download.bin";
       tasks.unshift({

@@ -267,7 +267,7 @@ dependencies = [
 
 [[package]]
 name = "engine-net"
-version = "1.0.0-beta5"
+version = "1.0.0-beta10.1"
 dependencies = [
  "base64 0.22.1",
  "hickory-resolver",

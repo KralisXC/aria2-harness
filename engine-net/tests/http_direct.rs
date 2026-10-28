@@ -255,3 +255,194 @@ async fn not_found_maps_to_resource_not_found() {
     assert_eq!(err.to_aria2_code(), 3);
     let _ = std::fs::remove_file(&dest);
 }
+
+// ---------------------------------------------------------------------------
+// beta10 模块 D：跳转链 Cookie 透传
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn redirect_chain_carries_cookie_and_absorbs_set_cookie() {
+    let seen = Arc::new(Mutex::new(Vec::<Req>::new()));
+    let seen_handler = Arc::clone(&seen);
+    let server = TestServer::start(move |req| {
+        seen_handler.lock().unwrap().push(req.clone());
+        match req.path.as_str() {
+            "/start" => response(
+                "302 Found",
+                &[("Location", "/mid"), ("Set-Cookie", "s=2; Path=/; HttpOnly")],
+                b"",
+            ),
+            "/mid" => response("302 Found", &[("Location", "/final")], b""),
+            _ => response("200 OK", &[], b"ok"),
+        }
+    })
+    .await;
+
+    let mut opts = options();
+    opts.headers = vec![("Cookie".to_string(), "a=1".to_string())];
+
+    let dest = temp_path("cookie-chain");
+    let req = DownloadRequest {
+        url: format!("http://127.0.0.1:{}/start", server.addr.port()),
+        dest: dest.clone(),
+        resume_from: 0,
+        options: opts,
+    };
+
+    let report = download(&req, &resolver()).await.expect("跟随重定向");
+    assert_eq!(report.redirects.len(), 2);
+    assert!(report.final_url.ends_with("/final"));
+
+    let requests = seen.lock().unwrap().clone();
+    let cookie_of = |path: &str| {
+        requests
+            .iter()
+            .find(|seen| seen.path == path)
+            .and_then(|seen| seen.headers.get("cookie").cloned())
+            .unwrap_or_default()
+    };
+    // 每一跳都携带初始 Cookie。
+    assert_eq!(cookie_of("/start"), "a=1");
+    // 第一跳的 Set-Cookie 同 host，进入下一跳。
+    assert!(cookie_of("/mid").contains("a=1"));
+    assert!(cookie_of("/mid").contains("s=2"));
+    assert!(cookie_of("/final").contains("s=2"));
+
+    let _ = std::fs::remove_file(&dest);
+}
+
+#[tokio::test]
+async fn twenty_redirects_succeed() {
+    // /r/0 → ... → /r/20：跟随 20 次 302 后拿到 200。
+    let server = TestServer::start(|req| {
+        let n: u32 = req.path.trim_start_matches("/r/").parse().unwrap_or(0);
+        if n < 20 {
+            response(
+                "302 Found",
+                &[("Location", &format!("/r/{}", n + 1))],
+                b"",
+            )
+        } else {
+            response("200 OK", &[], b"done")
+        }
+    })
+    .await;
+
+    let dest = temp_path("redirect-20");
+    let req = DownloadRequest {
+        url: format!("http://127.0.0.1:{}/r/0", server.addr.port()),
+        dest: dest.clone(),
+        resume_from: 0,
+        options: options(),
+    };
+
+    let report = download(&req, &resolver()).await.expect("20 跳应成功");
+    assert_eq!(report.redirects.len(), 20);
+    let _ = std::fs::remove_file(&dest);
+}
+
+#[tokio::test]
+async fn the_twenty_first_redirect_is_rejected() {
+    let server = TestServer::start(|_| response("302 Found", &[("Location", "/loop")], b"")).await;
+
+    let dest = temp_path("redirect-loop");
+    let req = DownloadRequest {
+        url: format!("http://127.0.0.1:{}/loop", server.addr.port()),
+        dest: dest.clone(),
+        resume_from: 0,
+        options: options(),
+    };
+
+    let err = download(&req, &resolver())
+        .await
+        .expect_err("第 21 跳应报重定向过多");
+    assert!(matches!(
+        err,
+        engine_net::error::NetworkError::TooManyRedirects
+    ));
+    let _ = std::fs::remove_file(&dest);
+}
+
+// ---------------------------------------------------------------------------
+// beta10 模块 E：HTML 误下载兜底
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn html_login_page_after_redirect_fails_before_writing() {
+    let server = TestServer::start(|req| {
+        if req.path == "/start" {
+            response("302 Found", &[("Location", "/login")], b"")
+        } else {
+            response(
+                "200 OK",
+                &[("Content-Type", "text/html; charset=utf-8")],
+                b"<html>login expired</html>",
+            )
+        }
+    })
+    .await;
+
+    let dest = temp_path("html-login");
+    let req = DownloadRequest {
+        url: format!("http://127.0.0.1:{}/start", server.addr.port()),
+        dest: dest.clone(),
+        resume_from: 0,
+        options: options(),
+    };
+
+    let err = download(&req, &resolver()).await.expect_err("登录页应被拦截");
+    assert_eq!(err.to_aria2_code(), 22);
+    assert!(!dest.exists(), "判定必须在打开目标文件之前");
+}
+
+#[tokio::test]
+async fn html_with_attachment_disposition_is_allowed() {
+    let server = TestServer::start(|_| {
+        response(
+            "200 OK",
+            &[
+                ("Content-Type", "text/html"),
+                ("Content-Disposition", "attachment; filename=\"page.html\""),
+            ],
+            b"<html>saved</html>",
+        )
+    })
+    .await;
+
+    let dest = temp_path("html-attachment");
+    let req = DownloadRequest {
+        url: format!("http://127.0.0.1:{}/page", server.addr.port()),
+        dest: dest.clone(),
+        resume_from: 0,
+        options: options(),
+    };
+
+    let report = download(&req, &resolver()).await.expect("显式附件应放行");
+    assert_eq!(report.written, b"<html>saved</html>".len() as u64);
+    let _ = std::fs::remove_file(&dest);
+}
+
+#[tokio::test]
+async fn html_error_page_keeps_rate_limit_semantics() {
+    let server = TestServer::start(|_| {
+        response(
+            "403 Forbidden",
+            &[("Content-Type", "text/html")],
+            b"<html>forbidden</html>",
+        )
+    })
+    .await;
+
+    let dest = temp_path("html-403");
+    let req = DownloadRequest {
+        url: format!("http://127.0.0.1:{}/blocked", server.addr.port()),
+        dest: dest.clone(),
+        resume_from: 0,
+        options: options(),
+    };
+
+    let err = download(&req, &resolver()).await.expect_err("403 应走限流");
+    // 403 的 HTML 错误页不能被当成「误下载网页」：交给限流降级处理。
+    assert!(err.is_rate_limited());
+    assert!(!dest.exists());
+}

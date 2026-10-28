@@ -30,6 +30,17 @@ function safeDecode(text: string): string {
 }
 
 /**
+ * 「不透明名」：无扩展名 + 长度 ≥ 16 + 全是 `[0-9A-Za-z_-]`。
+ *
+ * GitHub Release 直链的尾段常是一串哈希，直接显示只会让用户看到
+ * `abc123def4567890`。与 engine-net `out_name` 的判定保持同一条规则。
+ */
+export function isOpaqueName(name: string): boolean {
+  const text = name.trim();
+  return text.length >= 16 && !text.includes(".") && /^[0-9A-Za-z_-]+$/.test(text);
+}
+
+/**
  * 从下载地址推导临时文件名。
  *
  * - HTTP(S)：取路径最后一段，丢弃 query / hash；
@@ -43,7 +54,9 @@ export function nameFromUri(uri: string | undefined): string {
     return match ? safeDecode(match[1]).trim() : "";
   }
   const tail = raw.split(/[?#]/)[0].split(/[\\/]/).pop() ?? "";
-  return safeDecode(tail).trim();
+  const name = safeDecode(tail).trim();
+  // 哈希尾段宁可显示「解析文件名中...」，也不让 UI 闪一段无意义字符串。
+  return isOpaqueName(name) ? "" : name;
 }
 
 /** 任务显示名：真实文件名 → URL 尾段 → 解析中占位（绝不返回 GID）。 */

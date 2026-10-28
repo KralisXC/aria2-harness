@@ -1,5 +1,10 @@
 //! 插件运行时抽象（增量 25 · P2-D）。
 //!
+//! ## 懒加载红线（beta11 · A3）
+//!
+//! `load_source` 只接收入口产物文本/字节，**运行时不得预读**插件目录下的
+//! `bin/`、`models/`。这类大文件只允许在 `ctx.exec` 或插件显式文件读取时按路径加载。
+//!
 //! 双子后端共用的最小接口：
 //! - `QuickJsRuntime`（逻辑沙箱，默认后端）
 //! - `WasmRuntime`（Wasmtime 强隔离后端，由 `wasm-runtime` feature 门控）
@@ -38,6 +43,19 @@ pub trait PluginRuntime {
     /// 同步执行一次 hook；载荷为 POD JSON。
     fn invoke(&mut self, hook: &str, payload: &Value) -> Result<(), AppError>;
 
+    /// 以指定预算执行 hook，并返回其 JSON 返回值（beta10 任务路由 / 长任务使用）。
+    ///
+    /// 默认实现丢弃返回值；QuickJS 覆盖为带预算的 `call_hook_with_budget`。
+    fn invoke_with_budget(
+        &mut self,
+        hook: &str,
+        payload: &Value,
+        _budget_ms: u64,
+    ) -> Result<Option<Value>, AppError> {
+        self.invoke(hook, payload)?;
+        Ok(None)
+    }
+
     /// 退出前的尽力而为清理（绝不因异常打断退出流程）。
     fn shutdown(&mut self);
 }
@@ -53,6 +71,16 @@ impl PluginRuntime for super::quickjs::QuickJsRuntime {
 
     fn invoke(&mut self, hook: &str, payload: &Value) -> Result<(), AppError> {
         self.call_hook(hook, payload).map_err(AppError::from)
+    }
+
+    fn invoke_with_budget(
+        &mut self,
+        hook: &str,
+        payload: &Value,
+        budget_ms: u64,
+    ) -> Result<Option<Value>, AppError> {
+        self.call_hook_with_budget(hook, payload, budget_ms)
+            .map_err(AppError::from)
     }
 
     fn shutdown(&mut self) {

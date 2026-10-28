@@ -1,0 +1,37 @@
+{
+  "id": "com.harness.hls-downloader",
+  "name": "HLS 流视频下载",
+  "version": "1.0.1",
+  "author": "Aria2-Harness",
+  "description": "专治各种 m3u8 网课/视频。自动解析列表，高速下载分片并完美合并为完整 MP4。",
+  "apiVersion": "1.1",
+  "entry": "main.js",
+  "engine": "js",
+  "priority": 50,
+  "hooks": ["onTaskDetected", "onTaskRun", "onTaskCancel"],
+  "permissions": ["net:http", "downloads:write", "exec:ffmpeg", "fs:write:downloads"],
+  "limits": {
+    "timeoutMs": 5000,
+    "taskTimeoutMs": 1800000,
+    "maxHttpBytes": 8388608,
+    "maxTasksPerCall": 200,
+    "memoryMb": 64
+  },
+  "routing": [
+    { "pattern": "*.m3u8", "priority": 10, "handler": "onTaskDetected" }
+  ],
+  "settings_schema": [
+    {
+      "key": "custom_domains",
+      "label": "自定义解析域名白名单（每行一个，支持 * 通配符）",
+      "type": "textarea",
+      "default": ""
+    }
+  ],
+  "integrity": {
+    "algorithm": "sha256",
+    "files": {
+      "main.js": "8cf704cb6d54c8a4ed7d771c540511a48c76d937717dece0736d07f1065f9167"
+    }
+  }
+}

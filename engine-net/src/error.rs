@@ -34,6 +34,8 @@ pub enum NetworkError {
     ProxyError(String),
     /// 磁盘空间不足（Phase 4：预分配或多 worker 写入触发）。
     DiskFull,
+    /// beta9：回来的是一张网页而不是文件（鉴权过期 / 防爬重定向）。
+    HtmlInsteadOfFile,
     /// 其它网络问题。
     Network(String),
     /// 任务被取消（generation 失效）。
@@ -53,6 +55,31 @@ impl NetworkError {
                 | NetworkError::Network(_)
                 | NetworkError::HttpStatus(504)
         )
+    }
+
+    /// beta8.3：CDN 限流（403/429）走「暂停」而不是「失败」。
+    pub fn is_rate_limited(&self) -> bool {
+        matches!(self, NetworkError::HttpStatus(403 | 429))
+    }
+
+    /// beta9：代理断开 / 代理不可用（软件关闭、端口不可达、SOCKS5 握手失败）
+    /// 走「暂停」而不是「失败」，用户恢复代理后点继续即可续传。
+    pub fn is_proxy_disconnected(&self) -> bool {
+        matches!(
+            self,
+            NetworkError::ProxyConnectionFailed(_) | NetworkError::ProxyError(_)
+        )
+    }
+
+    /// beta9：统一的「可降级暂停原因」；`None` 表示应按原错误处理。
+    pub fn pause_reason(&self) -> Option<&'static str> {
+        if self.is_rate_limited() {
+            Some("rate-limit")
+        } else if self.is_proxy_disconnected() {
+            Some("proxy_disconnected")
+        } else {
+            None
+        }
     }
 
     /// 映射到 aria2 的 `errorCode`（RPC `tellStatus.errorCode` 原样回填）。
@@ -87,6 +114,8 @@ impl NetworkError {
             NetworkError::ProxyError(_) => 6,
             // DISK_FULL（项目扩展码 34，见 error_code.h）
             NetworkError::DiskFull => 34,
+            // HTTP_PROTOCOL_ERROR：响应体与预期文件类型不符。
+            NetworkError::HtmlInsteadOfFile => 22,
             // REMOVED
             NetworkError::Cancelled => 31,
             // CONNECTION_RESET（PROJECT 内部码，35）
@@ -110,6 +139,10 @@ impl fmt::Display for NetworkError {
             NetworkError::ProxyConnectionFailed(msg) => write!(f, "代理连接失败：{msg}"),
             NetworkError::ProxyError(msg) => write!(f, "代理错误：{msg}"),
             NetworkError::DiskFull => write!(f, "磁盘空间不足"),
+            NetworkError::HtmlInsteadOfFile => write!(
+                f,
+                "捕获到了网页而非文件，可能是鉴权已过期或被反爬拦截，请在浏览器中重新点击下载。"
+            ),
             NetworkError::Network(msg) => write!(f, "网络错误：{msg}"),
             NetworkError::Cancelled => write!(f, "任务已取消"),
         }
@@ -156,7 +189,57 @@ mod tests {
         );
         assert_eq!(NetworkError::ProxyError("x".into()).to_aria2_code(), 6);
         assert_eq!(NetworkError::DiskFull.to_aria2_code(), 34);
+        assert_eq!(NetworkError::HtmlInsteadOfFile.to_aria2_code(), 22);
         assert_eq!(NetworkError::Cancelled.to_aria2_code(), 31);
         assert_eq!(NetworkError::ConnectionReset.to_aria2_code(), 35);
+    }
+
+    #[test]
+    fn rate_limited_status_matrix() {
+        assert!(NetworkError::HttpStatus(403).is_rate_limited());
+        assert!(NetworkError::HttpStatus(429).is_rate_limited());
+        assert!(!NetworkError::HttpStatus(200).is_rate_limited());
+        assert!(!NetworkError::HttpStatus(401).is_rate_limited());
+        assert!(!NetworkError::HttpStatus(404).is_rate_limited());
+        assert!(!NetworkError::HttpStatus(500).is_rate_limited());
+        assert!(!NetworkError::Timeout.is_rate_limited());
+        assert!(!NetworkError::DnsFailure("x".into()).is_rate_limited());
+    }
+
+    /// beta9：限流与代理断开都走降级暂停，其余错误仍按原语义上报。
+    #[test]
+    fn pause_reason_matrix() {
+        assert_eq!(
+            NetworkError::HttpStatus(403).pause_reason(),
+            Some("rate-limit")
+        );
+        assert_eq!(
+            NetworkError::HttpStatus(429).pause_reason(),
+            Some("rate-limit")
+        );
+        assert_eq!(
+            NetworkError::ProxyConnectionFailed("refused".into()).pause_reason(),
+            Some("proxy_disconnected")
+        );
+        assert_eq!(
+            NetworkError::ProxyError("socks5".into()).pause_reason(),
+            Some("proxy_disconnected")
+        );
+        // 认证失败 / 408 / 404 / 超时不是「断开」，必须保留错误语义。
+        assert_eq!(NetworkError::ProxyAuthRequired.pause_reason(), None);
+        assert_eq!(NetworkError::Timeout.pause_reason(), None);
+        assert_eq!(NetworkError::HttpStatus(404).pause_reason(), None);
+    }
+
+    /// beta9：网页误下载必须给出可执行的业务指引，且不重试。
+    #[test]
+    fn html_instead_of_file_has_business_message() {
+        let err = NetworkError::HtmlInsteadOfFile;
+        assert_eq!(err.to_aria2_code(), 22);
+        assert!(!err.is_retryable());
+        assert_eq!(err.pause_reason(), None);
+        assert!(err.to_string().contains("捕获到了网页而非文件"));
+        assert!(err.to_string().contains("鉴权已过期或被反爬拦截"));
+        assert!(err.to_string().contains("在浏览器中重新点击下载"));
     }
 }

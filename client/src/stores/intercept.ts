@@ -16,6 +16,8 @@ export interface InterceptPayload {
   referer: string;
   cookie: string;
   user_agent: string;
+  /** 扩展嗅探到的完整请求头（`Name: Value` 行）；未嗅探到时为空。 */
+  headers?: string[];
   dir: string;
   /** 宿主接收时刻（Unix 毫秒），仅用于展示。 */
   received_at: number;

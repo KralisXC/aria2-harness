@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
@@ -20,10 +20,13 @@ use crate::dns::resolver::DnsResolver;
 use crate::download::{self, SharedControl, SlicingOptions};
 use crate::error::NetworkError;
 use crate::http::client::{DownloadRequest, HttpOptions, ProgressUpdate, download_with_progress};
+use crate::http::session::{HttpSession, probe_range};
 use crate::progress::ProgressStore;
 use crate::progress::control::{ControlFile, DEFAULT_PIECE_LENGTH};
+use crate::progress::sqlite_control::{legacy_path, sqlite_path};
 use crate::task::cancel::{bump, is_stale};
 use crate::task::event::{TaskEvent, TaskEventKind};
+use crate::task::naming;
 use crate::GID_PREFIX;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +72,8 @@ pub struct TaskSpec {
     pub uris: Vec<String>,
     /// 落盘绝对/相对路径（`dir` + `out` 已在 RPC 层解析）。
     pub dest: PathBuf,
+    /// 调用方是否显式填了 `out`。显式名不再做响应头改名的预探测。
+    pub explicit_out: bool,
     pub http: HttpOptions,
     pub piece_length: u32,
     /// Phase 4：动态切割参数。
@@ -83,6 +88,7 @@ impl TaskSpec {
         Self {
             uris,
             dest,
+            explicit_out: false,
             http: HttpOptions::default(),
             piece_length: DEFAULT_PIECE_LENGTH,
             slicing: SlicingOptions::default(),
@@ -110,6 +116,8 @@ pub struct TaskSnapshot {
     pub active_workers: u32,
     /// 预计剩余秒数（0 = 无法估算或已完成）。
     pub eta: u64,
+    /// 暂停原因：`Some("rate-limit")` 表示被 403/429 限流降级暂停（beta8.3）。
+    pub pause_reason: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -132,6 +140,8 @@ struct TaskState {
     bytes_at_start: u64,
     piece_progress: Vec<u8>,
     active_workers: u32,
+    /// 暂停原因：`Some("rate-limit")` 为 403/429 限流降级暂停（beta8.3）。
+    pause_reason: Option<String>,
 }
 
 impl TaskState {
@@ -146,6 +156,7 @@ impl TaskState {
             bytes_at_start: 0,
             piece_progress: Vec::new(),
             active_workers: 0,
+            pause_reason: None,
         }
     }
 }
@@ -153,6 +164,9 @@ impl TaskState {
 struct TaskHandle {
     gid: String,
     spec: TaskSpec,
+    /// 最终落盘路径。beta8.3：启动时按 `Content-Disposition` / 最终 URL 改名，
+    /// 改名必须发生在进度库创建之前，因此这里用锁而不是直接改 `spec.dest`。
+    dest: Mutex<PathBuf>,
     state: Mutex<TaskState>,
     generation: AtomicU64,
     join: Mutex<Option<JoinHandle<()>>>,
@@ -167,6 +181,22 @@ struct TaskHandle {
 const PROGRESS_EVENT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl TaskHandle {
+    /// 当前落盘路径（改名后以 `dest` 为准）。
+    fn dest_path(&self) -> PathBuf {
+        self.dest
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn set_dest(&self, path: PathBuf) {
+        let mut slot = self
+            .dest
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = path;
+    }
+
     /// 向 service 侧广播任务事件（无订阅者时静默丢弃）。
     fn emit(&self, kind: TaskEventKind) {
         let _ = self
@@ -207,7 +237,7 @@ impl TaskHandle {
             total_length: state.total_length,
             completed_length: state.completed_length,
             download_speed: speed,
-            dest: self.spec.dest.clone(),
+            dest: self.dest_path(),
             uris: self.spec.uris.clone(),
             error_code: state.error_code,
             error_message: state.error_message.clone(),
@@ -215,6 +245,7 @@ impl TaskHandle {
             piece_progress: state.piece_progress.clone(),
             active_workers: state.active_workers,
             eta,
+            pause_reason: state.pause_reason.clone(),
         }
     }
 
@@ -231,6 +262,7 @@ impl TaskHandle {
             state.status = TaskStatus::Active;
             state.error_code = None;
             state.error_message = None;
+            state.pause_reason = None;
             state.started_at = Some(Instant::now());
             state.bytes_at_start = state.completed_length;
             started
@@ -259,6 +291,7 @@ impl TaskHandle {
             }
             let previous = state.status;
             state.status = status;
+            state.pause_reason = None;
             state.started_at = None;
             // 离开 Active（暂停/移除/终态）后不再有活跃连接。
             state.active_workers = 0;
@@ -274,6 +307,22 @@ impl TaskHandle {
             }
         }
         true
+    }
+
+    /// beta8.3/beta9：限流（403/429）或代理断开 → 先强制同步落盘一次进度位图，
+    /// 再置为 Paused 并记录原因。顺序不可颠倒：暂停后调度器协程会被 abort，
+    /// 实时位图将不可读。
+    fn pause_for(&self, reason: &str, generation: u64) {
+        self.persist_control();
+        if self.set_status(generation, TaskStatus::Paused) {
+            let mut state = self.state.lock().unwrap();
+            state.pause_reason = Some(reason.to_string());
+        }
+        tracing::warn!(
+            gid = %self.gid,
+            reason,
+            "任务已降级暂停并保留进度"
+        );
     }
 
     fn fail(&self, generation: u64, code: i32, message: String) {
@@ -404,7 +453,10 @@ impl TaskHandle {
         if control.total_length == 0 {
             return;
         }
-        let store = Mutex::new(ProgressStore::open(&self.spec.dest, self.spec.sqlite_progress));
+        let store = Mutex::new(ProgressStore::open(
+            &self.dest_path(),
+            self.spec.sqlite_progress,
+        ));
         if let Err(err) = crate::progress::save_now(&store, &control) {
             tracing::warn!(gid = %self.gid, %err, "暂停时进度落盘失败");
         }
@@ -423,7 +475,7 @@ impl TaskHandle {
     /// 必须 `await` 它才能确保 future 已释放。
     fn abort_and_release(&self, cleanup_control: bool) {
         let join = self.join.lock().unwrap().take();
-        let dest = self.spec.dest.clone();
+        let dest = self.dest_path();
         let sqlite = self.spec.sqlite_progress;
         if let Some(join) = join {
             join.abort();
@@ -474,15 +526,25 @@ impl Registry {
     }
 
     /// 注册并立即调度下载；返回 16 位 GID（`fffe` + 12 位十六进制）。
-    pub fn add_uri(&self, spec: TaskSpec) -> Result<String, TaskError> {
+    ///
+    /// 落盘路径在这里（与插入任务同一把锁内）最终裁决：同名文件存在时自动
+    /// 改名为 `name (1).ext`，绝不覆盖用户已有数据。
+    pub fn add_uri(&self, mut spec: TaskSpec) -> Result<String, TaskError> {
         if spec.uris.is_empty() {
             return Err(TaskError::NoUri);
         }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let gid = format!("{GID_PREFIX:04x}{id:012x}");
+        // 解析 + 插入必须原子：否则两个并发 addUri 会同时选中同一个新名字。
+        let mut tasks = self.tasks.lock().unwrap();
+        spec.dest = unique_dest(&tasks, spec.dest);
+        // 自动改名可能追加 ` (1)`，可能把路径推过 260：再压一次长度（保留后缀）。
+        spec.dest = fit_dest(spec.dest);
+        let dest = Mutex::new(spec.dest.clone());
         let handle = Arc::new(TaskHandle {
             gid: gid.clone(),
             spec,
+            dest,
             state: Mutex::new(TaskState::new()),
             generation: AtomicU64::new(0),
             join: Mutex::new(None),
@@ -490,10 +552,8 @@ impl Registry {
             shared_control: Arc::new(Mutex::new(None)),
             last_progress: Mutex::new(None),
         });
-        self.tasks
-            .lock()
-            .unwrap()
-            .insert(gid.clone(), Arc::clone(&handle));
+        tasks.insert(gid.clone(), Arc::clone(&handle));
+        drop(tasks);
         tracing::info!(gid = %gid, uris = ?handle.spec.uris, "任务已创建");
 
         let generation = handle.generation.load(Ordering::SeqCst);
@@ -666,6 +726,162 @@ pub fn control_path(dest: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// 自动改名尝试上限：命中这么多同名文件说明目录已被玩坏，保留原名让任务报错。
+const MAX_RENAME_ATTEMPTS: u32 = 9999;
+
+/// 裁决最终落盘路径，避免同名下载互相覆盖。
+///
+/// 规则（与 Windows 资源管理器的「复制同名文件」一致）：
+/// 1. 目标已有 `.sqlite` / `.aria2` 控制文件，且没有活任务占用该路径 → 沿用原名
+///    （这是断点续传，重命名会让旧进度永远无法接上）；
+/// 2. 否则若物理文件 / 控制文件已存在，或已被内存中的任务占用 → `name (1).ext`；
+/// 3. `(1)` 也被占则 `(2)`、`(3)`… 直到找到空位；无扩展名时用 `name (1)`。
+fn unique_dest(tasks: &HashMap<String, Arc<TaskHandle>>, desired: PathBuf) -> PathBuf {
+    let reserved = |candidate: &Path| {
+        tasks.values().any(|handle| {
+            handle.dest_path().as_path() == candidate
+                // `removed` 只为了 tellStatus 保留快照，不应继续占名字：
+                // 用户删掉失败任务后重新添加，必须还能拿回原名。
+                && handle.state.lock().unwrap().status != TaskStatus::Removed
+        })
+    };
+    let exists = |candidate: &Path| {
+        sqlite_path(candidate).exists() || legacy_path(candidate).exists() || candidate.exists()
+    };
+
+    // 续传优先：只存在控制文件、没有活任务时保留原文件名。
+    if !reserved(&desired) && (sqlite_path(&desired).exists() || legacy_path(&desired).exists()) {
+        return desired;
+    }
+    if !reserved(&desired) && !exists(&desired) {
+        return desired;
+    }
+    for index in 1..=MAX_RENAME_ATTEMPTS {
+        let candidate = numbered_dest(&desired, index);
+        if !reserved(&candidate) && !exists(&candidate) {
+            return candidate;
+        }
+    }
+    desired
+}
+
+/// `game.zip` + 1 → `game (1).zip`；`game` + 1 → `game (1)`。
+///
+/// 用 `OsString` 拼接（而非 `to_string_lossy`），避免非 UTF-8 文件名被静默替换。
+fn numbered_dest(dest: &Path, index: u32) -> PathBuf {
+    let parent = dest.parent().unwrap_or_else(|| Path::new(""));
+    let mut name = dest
+        .file_stem()
+        .map(|stem| stem.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(" ({index})"));
+    if let Some(extension) = dest.extension() {
+        name.push(".");
+        name.push(extension);
+    }
+    parent.join(name)
+}
+
+/// 对最终 dest 再做一次 260 字符裁剪（` (1)` 后缀可能把路径推过上限）。
+fn fit_dest(dest: PathBuf) -> PathBuf {
+    let parent = dest
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    let Some(name) = dest.file_name().map(|name| name.to_string_lossy().into_owned()) else {
+        return dest;
+    };
+    if name.is_empty() {
+        return dest;
+    }
+    naming::fit_windows_path(&parent, &name)
+}
+
+/// 预探测改名等待上限：等响应头最多 20s，超时后保留临时名继续下载。
+const NAME_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// 用一次 `Range: bytes=0-0` 探测拿响应头与最终 URL，按 beta8.3 的优先级改名。
+///
+/// 必须在 `ProgressStore::open` 之前调用：`.sqlite` 与 dest 必须同名同目录。
+/// 探测失败（403/429/超时/协议错误）一律静默保留临时名 —— 限流暂停由主下载
+/// 路径统一处理，这里绝不把任务提前判死。
+async fn resolve_remote_dest(task: &TaskHandle, resolver: &DnsResolver, generation: u64) {
+    let url = task.spec.uris[0].clone();
+    let session = match HttpSession::new(task.spec.http.clone(), resolver.clone()) {
+        Ok(session) => session,
+        Err(err) => {
+            tracing::debug!(gid = %task.gid, %err, "取名预探测无法建立会话，保留临时名");
+            return;
+        }
+    };
+    let probe = match tokio::time::timeout(
+        NAME_PROBE_TIMEOUT,
+        session.get_range(&url, Some(probe_range())),
+    )
+    .await
+    {
+        Ok(Ok(probe)) => probe,
+        Ok(Err(err)) => {
+            tracing::debug!(gid = %task.gid, %err, "取名预探测失败，保留临时名");
+            return;
+        }
+        Err(_) => {
+            tracing::debug!(gid = %task.gid, "取名预探测超时，保留临时名");
+            return;
+        }
+    };
+
+    let status = probe.status.as_u16();
+    if status != 200 && status != 206 {
+        return;
+    }
+    let content_disposition = probe.content_disposition.clone();
+    let final_url = probe.final_url.clone();
+    drop(probe);
+
+    if is_stale(generation, task.generation.load(Ordering::SeqCst)) {
+        return;
+    }
+
+    let name = naming::resolve_out_name(None, content_disposition.as_deref(), &url, &final_url);
+    let current = task.dest_path();
+    // 续传优先：已有控制文件或文件本体时绝不改名，否则旧进度永远接不上。
+    if current.exists() || sqlite_path(&current).exists() || legacy_path(&current).exists() {
+        return;
+    }
+    let current_name = current
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if current_name == name {
+        return;
+    }
+    let dir = current.parent().map(Path::to_path_buf).unwrap_or_default();
+    let mut candidate = naming::fit_windows_path(&dir, &name);
+    if !dest_available(&candidate) {
+        let base = candidate.clone();
+        candidate = (1..=99u32)
+            .map(|index| numbered_dest(&base, index))
+            .find(|path| dest_available(path))
+            .unwrap_or(base);
+    }
+    if candidate == current {
+        return;
+    }
+    tracing::info!(
+        gid = %task.gid,
+        old = %current.display(),
+        new = %candidate.display(),
+        "按响应头 / 最终 URL 改名"
+    );
+    task.set_dest(fit_dest(candidate));
+}
+
+/// 目标路径尚可复用：文件本体与控制文件都不存在。
+fn dest_available(candidate: &Path) -> bool {
+    !candidate.exists() && !sqlite_path(candidate).exists() && !legacy_path(candidate).exists()
+}
+
 async fn run_task(
     task: Arc<TaskHandle>,
     resolver: DnsResolver,
@@ -680,8 +896,17 @@ async fn run_task(
     task.mark_active(generation);
     tracing::info!(gid = %task.gid, url = %task.spec.uris[0], "开始下载");
 
+    // beta8.3：用户没填 out 时，先用响应头 / 最终 URL 贪婪取名，再创建进度库。
+    if !task.spec.explicit_out {
+        resolve_remote_dest(&task, &resolver, generation).await;
+        if is_stale(generation, task.generation.load(Ordering::SeqCst)) {
+            return;
+        }
+    }
+    let dest = task.dest_path();
+
     let store = Arc::new(Mutex::new(ProgressStore::open(
-        &task.spec.dest,
+        &dest,
         task.spec.sqlite_progress,
     )));
     let mut tracker = match store
@@ -697,7 +922,7 @@ async fn run_task(
         Err(err) => {
             tracing::warn!(
                 gid = %task.gid,
-                dest = %task.spec.dest.display(),
+                dest = %dest.display(),
                 error = %err,
                 "控制文件解析失败，按 aria2 语义静默复位进度并从零继续下载"
             );
@@ -747,7 +972,7 @@ async fn run_task(
                 let task_ref = Arc::clone(&task);
                 let input = download::RunInput {
                     url: url.clone(),
-                    dest: task.spec.dest.clone(),
+                    dest: dest.clone(),
                     http: task.spec.http.clone(),
                     piece_length: task.spec.piece_length,
                     slicing: task.spec.slicing.clone(),
@@ -812,6 +1037,10 @@ async fn run_task(
                             .as_ref()
                             .map(|control| control.completed_bytes())
                             .unwrap_or(0);
+                        if let Some(reason) = err.pause_reason() {
+                            task.pause_for(reason, generation);
+                            return;
+                        }
                         if !err.is_retryable() || attempt + 1 >= task.spec.http.max_tries {
                             tracing::warn!(
                                 gid = %task.gid,
@@ -833,7 +1062,7 @@ async fn run_task(
 
             let request = DownloadRequest {
                 url: url.clone(),
-                dest: task.spec.dest.clone(),
+                dest: dest.clone(),
                 resume_from: completed_base,
                 options: task.spec.http.clone(),
             };
@@ -931,6 +1160,10 @@ async fn run_task(
                             tracing::warn!(gid = %task.gid, %err, "进度落盘失败");
                         }
                     }
+                    if let Some(reason) = err.pause_reason() {
+                        task.pause_for(reason, generation);
+                        return;
+                    }
                     completed_base = task.current_progress().1;
 
                     if total_mismatch {
@@ -1003,6 +1236,106 @@ mod tests {
         });
     }
 
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "aria2-harness-reg-{}-{tag}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 同名物理文件已存在 → 自动改成 `game (1).zip`（Windows 风格）。
+    #[test]
+    fn renames_when_physical_file_exists() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let dir = temp_dir("rename");
+            std::fs::write(dir.join("game.zip"), b"existing").unwrap();
+            let resolver = DnsResolver::new(&Default::default()).expect("resolver");
+            let registry = Registry::new(resolver);
+            let spec = TaskSpec::new(
+                vec!["http://127.0.0.1:1/game.zip".into()],
+                dir.join("game.zip"),
+            );
+            let gid = registry.add_uri(spec).expect("add");
+            assert_eq!(
+                registry.snapshot(&gid).unwrap().dest,
+                dir.join("game (1).zip")
+            );
+            registry.remove(&gid).expect("remove");
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// 连续添加两次：第二个必须拿到 `x (1).bin`，不能和第一个抢同一路径。
+    #[test]
+    fn duplicate_adds_get_distinct_paths() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let dir = temp_dir("dup");
+            let resolver = DnsResolver::new(&Default::default()).expect("resolver");
+            let registry = Registry::new(resolver);
+            let spec = || TaskSpec::new(vec!["http://127.0.0.1:1/x.bin".into()], dir.join("x.bin"));
+            let first = registry.add_uri(spec()).expect("add 1");
+            let second = registry.add_uri(spec()).expect("add 2");
+            assert_eq!(registry.snapshot(&first).unwrap().dest, dir.join("x.bin"));
+            assert_eq!(registry.snapshot(&second).unwrap().dest, dir.join("x (1).bin"));
+            registry.remove(&first).expect("remove 1");
+            registry.remove(&second).expect("remove 2");
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// 已有控制文件且没有活任务 → 保留原名（断点续传优先级高于防覆盖）。
+    #[test]
+    fn keeps_name_when_control_file_exists() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let dir = temp_dir("resume");
+            std::fs::write(dir.join("x.bin.sqlite"), b"ctrl").unwrap();
+            let resolver = DnsResolver::new(&Default::default()).expect("resolver");
+            let registry = Registry::new(resolver);
+            let spec = TaskSpec::new(vec!["http://127.0.0.1:1/x.bin".into()], dir.join("x.bin"));
+            let gid = registry.add_uri(spec).expect("add");
+            assert_eq!(registry.snapshot(&gid).unwrap().dest, dir.join("x.bin"));
+            registry.remove(&gid).expect("remove");
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// `(1)` / `(2)` 都被占用时继续递增；无扩展名时用 `name (1)` 形式。
+    #[test]
+    fn numbering_skips_taken_candidates() {
+        let dir = temp_dir("skip");
+        std::fs::write(dir.join("game.zip"), b"a").unwrap();
+        std::fs::write(dir.join("game (1).zip"), b"b").unwrap();
+        std::fs::write(dir.join("game (2).zip"), b"c").unwrap();
+        let tasks = HashMap::new();
+        assert_eq!(
+            unique_dest(&tasks, dir.join("game.zip")),
+            dir.join("game (3).zip")
+        );
+        assert_eq!(
+            numbered_dest(&PathBuf::from("game"), 1),
+            PathBuf::from("game (1)")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn remove_keeps_removed_status_for_tellstatus() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -1017,6 +1350,30 @@ mod tests {
             registry.remove(&gid).expect("remove");
             let snapshot = registry.snapshot(&gid).expect("snapshot");
             assert_eq!(snapshot.status, TaskStatus::Removed);
+        });
+    }
+
+    /// `add_uri` 遇到超长 dest 时必须压到 260 字符以内且保留后缀。
+    #[test]
+    fn add_uri_truncates_oversized_dest() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let resolver = DnsResolver::new(&Default::default()).expect("resolver");
+            let registry = Registry::new(resolver);
+            let name = format!("{}.zip", "长".repeat(300));
+            let spec = TaskSpec::new(
+                vec!["http://127.0.0.1:1/x".into()],
+                temp_dir("long-name").join(name),
+            );
+            let gid = registry.add_uri(spec).expect("add");
+            let dest = registry.snapshot(&gid).expect("snapshot").dest;
+            let text = dest.to_string_lossy();
+            assert!(text.ends_with(".zip"), "{text}");
+            assert!(text.chars().count() <= 260, "{}", text.chars().count());
+            registry.remove(&gid).expect("remove");
         });
     }
 }

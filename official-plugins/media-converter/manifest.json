@@ -1,0 +1,28 @@
+{
+  "id": "com.harness.media-converter",
+  "name": "本地媒体转换",
+  "version": "1.0.1",
+  "description": "下载完成后右键任务，一键极速将视频封装为 MP4，或提取出纯净的音频文件。",
+  "author": "Aria2-Harness",
+  "apiVersion": "1.1",
+  "entry": "main.js",
+  "engine": "js",
+  "priority": 60,
+  "hooks": ["onAction"],
+  "permissions": ["exec:ffmpeg", "fs:write:downloads", "notify"],
+  "actions": [
+    { "id": "to-mp4", "label": "极速转 MP4" },
+    { "id": "extract-audio", "label": "提取音轨" }
+  ],
+  "limits": {
+    "timeoutMs": 5000,
+    "taskTimeoutMs": 1800000,
+    "memoryMb": 64
+  },
+  "integrity": {
+    "algorithm": "sha256",
+    "files": {
+      "main.js": "23c41ee82ddbd2d3aa6ea2078b18981297db700b6b0851f879a3b31a8294cf44"
+    }
+  }
+}

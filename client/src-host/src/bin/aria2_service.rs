@@ -449,6 +449,11 @@ struct EngineHandle {
     exit_logged: bool,
     /// 6800 代理（仅 auto / native 模式）。
     proxy: Option<ProxyGuard>,
+    /// 6800 的**共享**密钥（仅代理档）。
+    ///
+    /// 用户改密钥时直接写这里：监听器不重建、连接不断开，下一条请求立即按新值鉴权。
+    /// 回滚档为 `None` —— 那时光明文密钥是 aria2c 启动参数，无法在线修改。
+    proxy_secret: Option<Arc<StdMutex<String>>>,
 }
 
 impl EngineHandle {
@@ -1042,6 +1047,33 @@ async fn route(
                 None => ServiceResponse::engine_status(false, None),
             }
         }
+        ServiceRequest::SetSecret { secret } => {
+            let mut guard = lock_engine(engine);
+            let Some(handle) = guard.as_mut() else {
+                return ServiceResponse::err("引擎未运行，无法修改 RPC 密钥");
+            };
+            if !handle.alive() {
+                return ServiceResponse::err("引擎未运行，无法修改 RPC 密钥");
+            }
+            let secret = secret.trim();
+            if secret.is_empty() {
+                return ServiceResponse::err("RPC 密钥不能为空");
+            }
+            let Some(shared) = handle.proxy_secret.clone() else {
+                // 回滚档：密钥是 aria2c 的 `--rpc-secret` 启动参数，在线修改必须重启引擎，
+                // 会中断当前下载（红线），因此明确拒绝而不是偷偷重启。
+                return ServiceResponse::err(
+                    "当前引擎模式（--engine=aria2）不支持在线修改 RPC 密钥，请重启应用后生效",
+                );
+            };
+            *shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = secret.to_string();
+            // `GetStatus` 回传的必须是最新值，否则 UI 重连会拿旧密钥。
+            handle.secret = secret.to_string();
+            println!("[svc] RPC 密钥已热更新（监听器与连接保持不变）");
+            ServiceResponse::ok()
+        }
         ServiceRequest::Shutdown => {
             println!("[svc] 收到 shutdown 指令，开始优雅退出");
             shutdown_engine(engine).await;
@@ -1078,7 +1110,9 @@ async fn start_engine(port: u16, engine: &Arc<StdMutex<Option<EngineHandle>>>) -
         }
     }
 
-    let secret = uuid::Uuid::new_v4().to_string();
+    // 用户在设置页保存过密钥就沿用（`config.json` 与 UI 同源），否则每次启动随机。
+    let secret = aria2_harness_lib::configured_rpc_secret()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     match engine_mode() {
         EngineMode::Aria2 => start_direct_engine(port, secret, engine).await,
         EngineMode::Auto | EngineMode::Native => {
@@ -1162,8 +1196,16 @@ async fn start_proxy_engine(
         Arc::clone(&aria2) as Arc<dyn EngineClient>,
         native_client,
     );
+    // 6800 的密钥必须是共享可变值：热更新时不重建监听器、不断开已有 WS 连接。
+    let shared_secret = Arc::new(StdMutex::new(public_secret.clone()));
     // 6800 先绑：绑定失败时还没拉起 aria2c，无需回滚进程。
-    let server = match router::start_server(Arc::clone(&router), port, public_secret.clone()).await {
+    let server = match router::start_server(
+        Arc::clone(&router),
+        port,
+        Arc::clone(&shared_secret),
+    )
+    .await
+    {
         Ok(server) => server,
         Err(err) => {
             return ServiceResponse::err(format!(
@@ -1196,6 +1238,7 @@ async fn start_proxy_engine(
     // 引擎侧密钥，这里必须覆盖；否则 UI 重连后拿着 inner_secret 调 6800，
     // 表现为"连接正常但所有 RPC 都 Unauthorized"。
     handle.secret = public_secret.clone();
+    handle.proxy_secret = Some(shared_secret);
     let pid = handle.pid;
     let resp = ServiceResponse::engine_started(public_secret, pid);
     *lock_engine(engine) = Some(handle);
@@ -1567,6 +1610,7 @@ fn spawn_engine(port: u16, secret: String) -> Result<EngineHandle, AppError> {
         exit_logged: false,
         // 6800 代理由 `start_engine` 在服务端绑定成功后再挂上。
         proxy: None,
+        proxy_secret: None,
     })
 }
 

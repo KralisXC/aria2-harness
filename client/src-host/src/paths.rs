@@ -124,7 +124,8 @@ pub fn web_root() -> PathBuf {
 
 /// 数据目录：**所有内部状态都下沉到这里**（SQLite / 会话 / tracker / 日志 / 错误页）。
 ///
-/// 红线：程序根目录只允许出现 `data` 与 `plugins` 两个文件夹。
+/// 红线：程序根目录只允许出现 `data` 一个文件夹（beta10.1 起 plugins 也下沉到
+/// `data/plugins`，安装目录下不再有空的 plugins / downloads 占位目录）。
 pub fn data_dir() -> PathBuf {
     home().join("data")
 }
@@ -141,9 +142,18 @@ pub fn error_pages_dir() -> PathBuf {
 
 /// 插件目录（扫描 / 热重载 / registry.json）。
 ///
-/// 刻意**不**下沉到 `data`：用户需要直接往这里拖放插件，保持根目录可见。
+/// beta10 起统一为 `data/plugins`：插件是**自包含文件夹**（含 `bin/ffmpeg.exe` 等
+/// 依赖），与任务库、日志同属可写数据根，安装包 / Lite 用户都只需认这一个路径。
 pub fn plugins_dir() -> PathBuf {
-    home().join("plugins")
+    data_dir().join("plugins")
+}
+
+/// 插件配置目录（beta11 · C1）：`data/plugins/configs`，每插件一个 `<id>.json`。
+///
+/// 与插件目录同级但**不是插件**：扫描 / 热重载都必须跳过它（见
+/// `manager::plugin_dir_name` 与 `PluginManager::load_all`）。
+pub fn plugin_configs_dir() -> PathBuf {
+    plugins_dir().join("configs")
 }
 
 /// 默认下载目录：Windows 系统「下载」文件夹（`FOLDERID_Downloads`）。

@@ -76,6 +76,8 @@ pub struct InterceptedTask {
     pub referer: String,
     pub cookie: String,
     pub user_agent: String,
+    /// 扩展嗅探到的完整浏览器请求头（`Name: Value` 行）；可缺省。
+    pub headers: Vec<String>,
     pub dir: String,
     /// 接收时刻（Unix 毫秒）：仅供 UI / 排查展示，**不做任何过期判定**。
     pub received_at: u64,
@@ -220,6 +222,8 @@ async fn bind_with_fallback(base: u16) -> io::Result<(TcpListener, u16)> {
 struct Request {
     method: String,
     path: String,
+    /// 查询参数（percent-decoded）；`/check?url=...` 使用。
+    query: HashMap<String, String>,
     headers: HashMap<String, String>,
     body: Vec<u8>,
 }
@@ -265,16 +269,20 @@ async fn handle(mut stream: TcpStream) -> io::Result<()> {
         return write_json(&mut stream, 204, &Value::Null).await;
     }
 
-    // 鉴权闸门：只对写入型路由 `/add` 强制 Token，探测型 `/status`、`/ping`
-    // 保持开放。缺失或不匹配一律 403（不是 401：本机 API 不提供认证挑战）。
-    if request.method == "POST" && request.path == "/add" {
+    // 鉴权闸门：写入型路由（`/add`）与全息探针（`/probe`、`/check`）强制 Token；
+    // 探测型 `/status`、`/ping` 保持开放。缺失或不匹配一律 403。
+    if requires_token(&request.method, &request.path) {
         let provided = request
             .headers
             .get("x-harness-token")
             .map(String::as_str)
             .unwrap_or_default();
         if provided != token() {
-            tracing::warn!("本地接管 API 拒绝 POST /add：X-Harness-Token 缺失或不匹配");
+            tracing::warn!(
+                "本地接管 API 拒绝 {} {}：X-Harness-Token 缺失或不匹配",
+                request.method,
+                request.path
+            );
             return write_json(
                 &mut stream,
                 403,
@@ -288,17 +296,140 @@ async fn handle(mut stream: TcpStream) -> io::Result<()> {
     write_json(&mut stream, status, &body).await
 }
 
-/// 路由表：`GET /status`、`GET /auto-token`、`POST /ping`、`POST /add`。
+/// 需要 `X-Harness-Token` 的路由（写入型 + 页面探针 / 预检）。
+fn requires_token(method: &str, path: &str) -> bool {
+    matches!(
+        (method, path),
+        ("POST", "/add") | ("POST", "/probe") | ("GET", "/check")
+    )
+}
+
+/// 路由表：`GET /status`、`GET /auto-token`、`POST /ping`、`POST /add`、
+/// `POST /probe`、`GET /check`。
 async fn route(request: Request) -> (u16, Value) {
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/status") => (200, json!({ "status": "ok", "version": ENGINE_VERSION })),
         ("GET", "/auto-token") => auto_token(&request),
         ("POST", "/ping") => (200, json!({ "status": "ok", "pong": true })),
         ("POST", "/add") => add_download(request).await,
+        ("POST", "/probe") => probe(&request),
+        ("GET", "/check") => check(&request),
         _ => (
             404,
-            json!({ "status": "error", "message": "未知路由（仅支持 GET /status、GET /auto-token、POST /ping、POST /add）" }),
+            json!({ "status": "error", "message": "未知路由（仅支持 /status、/auto-token、/ping、/add、/probe、/check）" }),
         ),
+    }
+}
+
+/// `POST /probe`：解析全息包，只唤醒域名命中的插件（beta12 · 模块 E）。
+///
+/// 红线：解析失败不触碰插件系统；插件管理器未初始化时返回 503 而非 panic。
+fn probe(request: &Request) -> (u16, Value) {
+    let value: Value = match serde_json::from_slice(&request.body) {
+        Ok(value) => value,
+        Err(e) => {
+            return (
+                400,
+                json!({ "status": "error", "message": format!("JSON 解析失败：{e}") }),
+            );
+        }
+    };
+    let packet = match crate::plugin::holo::from_probe(&value) {
+        Ok(packet) => packet,
+        Err(message) => return (400, json!({ "status": "error", "message": message })),
+    };
+
+    let Some(manager) = crate::plugins_opt() else {
+        return (
+            503,
+            json!({ "status": "inactive", "host": packet.host }),
+        );
+    };
+    let matched = manager.dispatch_holo(&packet);
+    tracing::info!(
+        "全息探针：host={}，命中插件 {} 个",
+        packet.host,
+        matched.len()
+    );
+    (200, json!({ "status": "ok", "host": packet.host, "matched": matched }))
+}
+
+/// `GET /check?url=...`：轻量域名预检，**不改变激活状态**（beta12 · 模块 E）。
+fn check(request: &Request) -> (u16, Value) {
+    let url = request
+        .query
+        .get("url")
+        .map(String::as_str)
+        .unwrap_or_default()
+        .trim();
+    if url.is_empty() {
+        return (
+            400,
+            json!({ "status": "error", "message": "缺少 url 参数" }),
+        );
+    }
+    let lower = url.to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return (
+            400,
+            json!({ "status": "error", "message": "仅支持 http/https URL" }),
+        );
+    }
+    let host = crate::url_host(url);
+    if host.is_empty() {
+        return (
+            400,
+            json!({ "status": "error", "message": "无法从 url 解析主机名" }),
+        );
+    }
+    let Some(manager) = crate::plugins_opt() else {
+        return (503, json!({ "status": "inactive", "host": host }));
+    };
+    let matched = manager.match_holo(&host);
+    (200, json!({ "status": "ok", "host": host, "matched": matched }))
+}
+
+/// 解析 `target` 中的查询串（percent-decoding，`+` 视为空格）。
+fn parse_query(target: &str) -> HashMap<String, String> {
+    let Some((_, raw)) = target.split_once('?') else {
+        return HashMap::new();
+    };
+    let mut out = HashMap::new();
+    for pair in raw.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        out.insert(percent_decode(key), percent_decode(value));
+    }
+    out
+}
+
+/// 最小 percent-decode（不引入额外依赖）。
+fn percent_decode(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(high), Some(low)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2])) {
+                out.push((high << 4) | low);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -358,6 +489,9 @@ struct AddPayload {
     cookie: Option<String>,
     #[serde(default, rename = "user_agent", alias = "userAgent")]
     user_agent: Option<String>,
+    /// 扩展嗅探到的完整浏览器请求头（`Name: Value` 行），可缺省。
+    #[serde(default)]
+    headers: Vec<String>,
     #[serde(default)]
     dir: Option<String>,
 }
@@ -389,6 +523,7 @@ async fn add_download(request: Request) -> (u16, Value) {
         referer: sanitize_header(payload.referer.as_deref()).unwrap_or_default(),
         cookie: sanitize_header(payload.cookie.as_deref()).unwrap_or_default(),
         user_agent: sanitize_header(payload.user_agent.as_deref()).unwrap_or_default(),
+        headers: clean_headers(&payload.headers),
         dir: payload
             .dir
             .map(|value| value.trim().to_string())
@@ -426,6 +561,41 @@ async fn add_download(request: Request) -> (u16, Value) {
 fn sanitize_header(raw: Option<&str>) -> Option<String> {
     raw.map(|value| value.replace(['\r', '\n'], " ").trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+/// 清洗扩展投递的完整请求头：逐行去 CR/LF、丢弃 hop-by-hop / Cookie / Host，
+/// 按头名去重（保留首次），上限 64 行、单行 4KB。
+fn clean_headers(raw: &[String]) -> Vec<String> {
+    const MAX_HEADERS: usize = 64;
+    const MAX_LINE: usize = 4096;
+    let dropped = [
+        "host", "content-length", "connection", "keep-alive", "proxy-connection",
+        "transfer-encoding", "upgrade", "te", "trailer", "cookie",
+    ];
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for line in raw {
+        let line = line.replace(['\r', '\n'], " ");
+        let line = line.trim();
+        if line.is_empty() || line.len() > MAX_LINE {
+            continue;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim().to_ascii_lowercase();
+        if name.is_empty() || !name.is_ascii() || dropped.contains(&name.as_str()) {
+            continue;
+        }
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        out.push(format!("{}: {}", name, value.trim()));
+        if out.len() >= MAX_HEADERS {
+            break;
+        }
+    }
+    out
 }
 
 /// 读取并解析 HTTP/1.1 请求（头 + Content-Length 指定的 body）。
@@ -502,6 +672,7 @@ async fn read_request(stream: &mut TcpStream) -> Result<Request, HttpError> {
     Ok(Request {
         method,
         path,
+        query: parse_query(target),
         headers,
         body,
     })
@@ -563,6 +734,7 @@ fn reason(status: u16) -> &'static str {
         413 => "Payload Too Large",
         431 => "Request Header Fields Too Large",
         502 => "Bad Gateway",
+        503 => "Service Unavailable",
         _ => "OK",
     }
 }
@@ -572,8 +744,9 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        auto_token, find_subslice, is_extension_origin, is_trusted_token_client, reason,
-        sanitize_header, Request,
+        auto_token, check, clean_headers, find_subslice, is_extension_origin,
+        is_trusted_token_client, parse_query, probe, reason, requires_token, sanitize_header,
+        Request,
     };
 
     #[test]
@@ -586,6 +759,7 @@ mod tests {
             Request {
                 method: "GET".to_string(),
                 path: "/auto-token".to_string(),
+                query: HashMap::new(),
                 headers,
                 body: Vec::new(),
             }
@@ -643,9 +817,94 @@ mod tests {
     }
 
     #[test]
+    fn cleans_injected_and_duplicate_headers() {
+        let cleaned = clean_headers(&[
+            "User-Agent: Chrome\r\n".to_string(),
+            "user-agent: duplicate".to_string(),
+            "Cookie: a=b".to_string(),
+            "Host: evil".to_string(),
+            "Referer: https://a.test/x".to_string(),
+            "not-a-header".to_string(),
+            "  ".to_string(),
+        ]);
+        assert_eq!(
+            cleaned,
+            vec![
+                "user-agent: Chrome".to_string(),
+                "referer: https://a.test/x".to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn reason_covers_used_status_codes() {
         assert_eq!(reason(200), "OK");
         assert_eq!(reason(403), "Forbidden");
         assert_eq!(reason(401), "Unauthorized");
+        assert_eq!(reason(503), "Service Unavailable");
+    }
+
+    /// beta12 · 模块 E：探针与预检必须带 Token，探测型路由保持开放。
+    #[test]
+    fn probe_and_check_require_token() {
+        assert!(requires_token("POST", "/probe"));
+        assert!(requires_token("GET", "/check"));
+        assert!(requires_token("POST", "/add"));
+        assert!(!requires_token("GET", "/status"));
+        assert!(!requires_token("POST", "/ping"));
+        assert!(!requires_token("GET", "/auto-token"));
+    }
+
+    /// beta12 · 模块 E：查询串必须正确 percent-decode（URL 内层 `?` 不能被截断）。
+    #[test]
+    fn query_is_percent_decoded() {
+        let query = parse_query(
+            "/check?url=https%3A%2F%2Fwww.bilibili.com%2Fvideo%2FBV1xx%3Fp%3D1&x=a+b",
+        );
+        assert_eq!(
+            query.get("url").map(String::as_str),
+            Some("https://www.bilibili.com/video/BV1xx?p=1")
+        );
+        assert_eq!(query.get("x").map(String::as_str), Some("a b"));
+        assert!(parse_query("/status").is_empty());
+    }
+
+    /// beta12 · 模块 E：非法 JSON 在触碰插件系统之前就被拒绝。
+    #[test]
+    fn probe_rejects_invalid_json_before_plugins() {
+        let request = Request {
+            method: "POST".to_string(),
+            path: "/probe".to_string(),
+            query: HashMap::new(),
+            headers: HashMap::new(),
+            body: b"{not-json".to_vec(),
+        };
+        let (status, body) = probe(&request);
+        assert_eq!(status, 400);
+        assert_eq!(body["status"], "error");
+    }
+
+    /// beta12 · 模块 E：`/check` 对非 http(s) / 空 URL 直接拒绝。
+    #[test]
+    fn check_rejects_bad_urls() {
+        let mut query = HashMap::new();
+        query.insert("url".to_string(), "file:///C:/x".to_string());
+        let request = Request {
+            method: "GET".to_string(),
+            path: "/check".to_string(),
+            query,
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        assert_eq!(check(&request).0, 400);
+
+        let request = Request {
+            method: "GET".to_string(),
+            path: "/check".to_string(),
+            query: HashMap::new(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        assert_eq!(check(&request).0, 400);
     }
 }

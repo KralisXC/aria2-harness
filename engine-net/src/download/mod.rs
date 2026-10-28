@@ -16,7 +16,7 @@ use std::time::Duration;
 use crate::dns::resolver::DnsResolver;
 use crate::error::NetworkError;
 use crate::http::client::HttpOptions;
-use crate::http::session::{probe_range, HttpSession};
+use crate::http::session::{HttpSession, allows_html_download, is_html_body, probe_range};
 use crate::progress::control::ControlFile;
 use crate::progress::ProgressStore;
 
@@ -155,6 +155,14 @@ where
         None => {
             let probe = session.get_range(&input.url, Some(probe_range())).await?;
             let status = probe.status.as_u16();
+            // beta9：探测就发现是网页时立即终止 —— 控制文件不建、磁盘不写。
+            // 仅成功响应：403/429 的错误页也是 text/html，需留给限流降级。
+            if matches!(status, 200 | 206)
+                && is_html_body(probe.content_type.as_deref())
+                && !allows_html_download(&input.dest, probe.content_disposition.as_deref())
+            {
+                return Err(NetworkError::HtmlInsteadOfFile);
+            }
             let final_url = probe.final_url.clone();
             let total = match status {
                 206 => match probe.content_range.and_then(|(_, _, total)| total) {

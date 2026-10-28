@@ -10,7 +10,7 @@
  *   「是」= 只关掉提示框、留在设置里；「否」= 放弃改动并关闭整个设置弹窗。
  */
 import { computed, onMounted, reactive, ref, watch } from "vue";
-import { NAlert, NModal, NSelect, NSwitch } from "naive-ui";
+import { NAlert, NInput, NModal, NSelect, NSwitch } from "naive-ui";
 import AppIcon from "../components/AppIcon.vue";
 import { errText, invoke } from "../ipc";
 import {
@@ -18,6 +18,7 @@ import {
   writeDeleteBehavior,
   type DeleteBehavior,
 } from "../utils/deleteBehavior";
+import { PAGE_SIZE_EVENT, PAGE_SIZE_OPTIONS, readPageSize, writePageSize } from "../utils/pageSize";
 import { useSystemStore } from "../stores/system";
 import { useThemeStore, type ThemeMode } from "../stores/theme";
 
@@ -178,6 +179,22 @@ function onDeleteBehaviorChange(value: string) {
 // 下拉框改动即时落盘：下载页下次点删除就会按新偏好执行（不必等「保存」）。
 watch(deleteBehavior, (value) => writeDeleteBehavior(value));
 
+/** 下载列表每页条数（beta10.1）：与下载页分页器共用 localStorage 键。 */
+const PAGE_SIZE_SELECT_OPTIONS = PAGE_SIZE_OPTIONS.map((value) => ({
+  label: `${value} 条`,
+  value,
+}));
+
+const pageSize = ref(readPageSize());
+
+function onPageSizeChange(value: number) {
+  if (!(PAGE_SIZE_OPTIONS as readonly number[]).includes(value)) return;
+  pageSize.value = value;
+  writePageSize(value);
+  // 同窗口内不会触发 storage 事件，下载页靠这个自定义事件即时生效。
+  window.dispatchEvent(new Event(PAGE_SIZE_EVENT));
+}
+
 /** 已确认生效的值：保存成功后才更新，取消绝不触碰。 */
 const saved = reactive({
   // 默认空：真实值由宿主 `config.json` 回填（后端缺省为系统「下载」文件夹），
@@ -199,6 +216,8 @@ const saved = reactive({
   headers: "",
   // HTTP/1.1 兼容模式：存宿主本地配置，默认关闭。
   http1Compat: false,
+  // RPC 密钥：服务端真值（不落前端存储），由 `get_rpc_secret` 回填。
+  rpcSecret: "",
 });
 
 interface DraftSettings {
@@ -220,6 +239,7 @@ interface DraftSettings {
   headers: string;
   trackerInject: boolean;
   http1Compat: boolean;
+  rpcSecret: string;
 }
 
 /** 弹窗草稿：打开时深拷贝当前状态，关闭即整体丢弃。 */
@@ -242,6 +262,7 @@ const draft = reactive<DraftSettings>({
   headers: "",
   trackerInject: false,
   http1Compat: false,
+  rpcSecret: "",
 });
 
 /** UA 预设选择：命中预设即显示预设名，否则落到「自定义」。 */
@@ -314,6 +335,7 @@ function resetDraft() {
     headers: saved.headers,
     trackerInject: system.trackers?.injecting ?? false,
     http1Compat: saved.http1Compat,
+    rpcSecret: saved.rpcSecret,
   });
 }
 
@@ -470,6 +492,19 @@ async function loadHostConfig() {
   }
 }
 
+/**
+ * RPC 密钥的唯一来源是宿主内存镜像（服务端真值），不读 `config.json`：
+ * 用户从未保存过时，配置里没有该键，但服务实际在用的随机密钥必须能展示出来。
+ */
+async function loadRpcSecret() {
+  try {
+    const secret = await invoke<string>("get_rpc_secret");
+    if (typeof secret === "string") saved.rpcSecret = secret;
+  } catch {
+    // 宿主未就绪：保持空串，保存时会给出明确错误。
+  }
+}
+
 /** 调起系统文件夹选择器（原生 IFileOpenDialog）。 */
 async function browseDir() {
   try {
@@ -536,7 +571,8 @@ const changed = computed(() => {
       draftProxy !== savedProxy ||
       draft.userAgent.trim() !== saved.userAgent.trim() ||
       draft.referer.trim() !== saved.referer ||
-      draft.http1Compat !== saved.http1Compat,
+      draft.http1Compat !== saved.http1Compat ||
+      draft.rpcSecret.trim() !== saved.rpcSecret,
     advanced:
       draft.slicing !== saved.slicing ||
       normalizeHeaders(draft.headers) !== saved.headers ||
@@ -639,6 +675,32 @@ async function save() {
     const options: Record<string, string> = { "all-proxy": proxy };
     const userAgent = draft.userAgent.trim();
     const referer = draft.referer.trim();
+    // 密钥先改：服务端拒绝（如 --engine=aria2 回滚档）时不继续下发其余网络配置，
+    // 避免出现"部分保存成功"的错位状态。
+    const nextSecret = draft.rpcSecret.trim();
+    if (nextSecret !== saved.rpcSecret) {
+      if (nextSecret.length < 8 || nextSecret.length > 128) {
+        activeKey.value = "network";
+        settingsMessage.value = "RPC 密钥长度需为 8–128 个字符";
+        return;
+      }
+      if (/\s/.test(nextSecret)) {
+        activeKey.value = "network";
+        settingsMessage.value = "RPC 密钥不能包含空格等空白字符";
+        return;
+      }
+      settingsSaving.value = true;
+      try {
+        await invoke("set_rpc_secret", { secret: nextSecret });
+      } catch (error) {
+        activeKey.value = "network";
+        settingsMessage.value = `保存失败：${errText(error)}`;
+        return;
+      } finally {
+        settingsSaving.value = false;
+      }
+      saved.rpcSecret = nextSecret;
+    }
     // 留空表示不下发（保留引擎当前值），避免把空 UA 写进请求头。
     if (userAgent) options["user-agent"] = userAgent;
     // Referer 允许清空：空串写回引擎即关闭全局兜底，内置智能匹配随即可用。
@@ -846,6 +908,21 @@ async function writeClipboard(text: string) {
   }
 }
 
+/** RPC 密钥复制：按钮就地变「已复制」+ 底部 Toast，2s 后一起复位。 */
+const secretCopied = ref(false);
+let secretCopyTimer: number | undefined;
+
+async function copyRpcSecret() {
+  const value = draft.rpcSecret.trim();
+  if (!value) return;
+  await writeClipboard(value);
+  secretCopied.value = true;
+  if (secretCopyTimer) window.clearTimeout(secretCopyTimer);
+  secretCopyTimer = window.setTimeout(() => {
+    secretCopied.value = false;
+  }, 2000);
+}
+
 /**
  * 打开扩展安装引导：先取扩展的真实物理目录。
  *
@@ -899,6 +976,7 @@ async function hydrate() {
   // 唯一回显来源：宿主 config.json（IPC）。不再读 localStorage，也不回读引擎全局值。
   await loadHostConfig();
   await Promise.all([loadAutostart(), system.loadTrackers()]);
+  await loadRpcSecret();
   void loadAppPaths();
   void loadApiInfo();
   resetDraft();
@@ -1039,6 +1117,17 @@ watch(
               <small class="hint">
                 每次询问会在下载页弹窗确认；「同时删除本地文件」连同 .aria2 进度文件一起清理，不可恢复
               </small>
+            </div>
+            <div class="field">
+              <span><AppIcon name="dashboard" :size="13" class="field-icon" /> 每页显示数量</span>
+              <n-select
+                :value="pageSize"
+                class="concurrency-select"
+                :options="PAGE_SIZE_SELECT_OPTIONS"
+                :consistent-menu-width="false"
+                @update:value="onPageSizeChange"
+              />
+              <small class="hint">下载列表每页展示的任务条数，立即生效</small>
             </div>
             <label class="field">
               <span><AppIcon name="download" :size="13" class="field-icon" /> 全局下载限速</span>
@@ -1195,6 +1284,31 @@ watch(
             <small class="hint">端口由宿主启动参数固定，出于安全考虑不可在 UI 修改</small>
 
             <div class="field">
+              <span><AppIcon name="gauge" :size="13" class="field-icon" /> RPC 密钥</span>
+              <div class="secret-row">
+                <n-input
+                  v-model:value="draft.rpcSecret"
+                  :type="draft.showAdvanced ? 'text' : 'password'"
+                  :show-password="!draft.showAdvanced"
+                  maxlength="128"
+                  placeholder="至少 8 个字符，不含空白"
+                />
+                <button
+                  class="btn-ghost secret-copy"
+                  type="button"
+                  :disabled="!draft.rpcSecret"
+                  @click="copyRpcSecret"
+                >
+                  <AppIcon :name="secretCopied ? 'check' : 'copy'" :size="14" />
+                  {{ secretCopied ? "已复制" : "复制" }}
+                </button>
+              </div>
+              <small class="hint">
+                保存后立即生效，不会中断正在下载的任务；开启「高级 → 显示高级 / 开发者选项」后此处以明文显示
+              </small>
+            </div>
+
+            <div class="field">
               <span><AppIcon name="plugin" :size="13" class="field-icon" /> 浏览器接管 API</span>
               <div class="readonly-row">
                 <span>监听地址</span>
@@ -1277,7 +1391,7 @@ watch(
               <span class="brand-mark">A2</span>
               <div>
                 <b>Aria2-Harness</b>
-                <small>v1.0.0-beta8 · 纯血 Rust 下载引擎</small>
+                <small>v1.0.0-rc1 · 纯血 Rust 下载引擎</small>
               </div>
             </div>
 
@@ -1422,6 +1536,16 @@ watch(
         </div>
       </template>
     </n-modal>
+
+    <!-- 复制密钥的轻量 Toast：Teleport 到 body，避免被设置弹窗的滚动容器裁掉 -->
+    <Teleport to="body">
+      <Transition name="secret-toast">
+        <div v-if="secretCopied" class="secret-toast">
+          <AppIcon name="check" :size="14" />
+          密钥已复制
+        </div>
+      </Transition>
+    </Teleport>
 </template>
 
 <style scoped>
@@ -2056,5 +2180,49 @@ watch(
   .nav-arrow {
     display: none;
   }
+}
+
+/* ---- RPC 密钥：输入框 + 复制按钮 ---- */
+.secret-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.secret-row .n-input {
+  flex: 1;
+  min-width: 0;
+}
+.secret-copy {
+  flex: none;
+  white-space: nowrap;
+}
+
+/* ---- 复制成功的轻量 Toast（fixed 到视口底部，不受弹窗裁切影响）---- */
+.secret-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 36px;
+  z-index: 4000;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 16px;
+  border-radius: 999px;
+  background: rgba(17, 24, 39, 0.92);
+  color: #f8fafc;
+  font-size: 13px;
+  line-height: 1;
+  box-shadow: 0 10px 26px rgba(15, 23, 42, 0.28);
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+.secret-toast-enter-active,
+.secret-toast-leave-active {
+  transition: opacity 0.18s ease, transform 0.18s ease;
+}
+.secret-toast-enter-from,
+.secret-toast-leave-to {
+  opacity: 0;
+  transform: translate(-50%, 8px);
 }
 </style>

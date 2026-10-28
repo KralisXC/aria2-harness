@@ -365,10 +365,10 @@ impl Router {
             "aria2.pauseAll" | "aria2.unpauseAll" | "aria2.forcePauseAll" => {
                 self.pause_all(method).await
             }
-            "aria2.purgeDownloadResult" => {
-                let value = self.broadcast_first_ok(method, &args).await?;
-                Ok(value)
-            }
+            // 清空已完成必须对**所有**引擎生效：auto 模式下历史任务分散在
+            // native 与 aria2c 两张表里，只清一个会让另一个的"幽灵记录"继续
+            // 显示在列表里（beta10 实测问题）。并发下发，全部成功才算成功。
+            "aria2.purgeDownloadResult" => self.broadcast_all(method, &args).await,
             // 停机类方法一律交给 aria2c（与回滚档行为一致），绝不能落 -32601。
             "aria2.shutdown" | "aria2.forceShutdown" => {
                 self.dispatch(EngineKind::Aria2, method, &args).await
@@ -585,20 +585,34 @@ impl Router {
         Ok(())
     }
 
-    /// `purgeDownloadResult` 等"能生效即可"的方法：任一引擎成功就算成功。
-    async fn broadcast_first_ok(
-        &self,
-        method: &str,
-        args: &[Value],
-    ) -> Result<Value, EngineError> {
+    /// 对所有引擎并发下发同一请求，**全部成功**才算成功。
+    ///
+    /// 与 `broadcast_first_ok` 的差别：任何一个引擎失败都会把错误回传给调用方，
+    /// 绝不因为"另一个引擎清干净了"就谎报成功（beta10 的幽灵残留根因）。
+    /// 没有任何引擎时返回 `OK`（无事可做本身就是成功）。
+    async fn broadcast_all(&self, method: &str, args: &[Value]) -> Result<Value, EngineError> {
+        let requests = self
+            .query_engines()
+            .into_iter()
+            .map(|kind| self.dispatch(kind, method, args));
+        let results = futures_util::future::join_all(requests).await;
+
+        let mut first_ok: Option<Value> = None;
         let mut last_error: Option<EngineError> = None;
-        for kind in self.query_engines() {
-            match self.dispatch(kind, method, args).await {
-                Ok(value) => return Ok(value),
+        for result in results {
+            match result {
+                Ok(value) => {
+                    if first_ok.is_none() {
+                        first_ok = Some(value);
+                    }
+                }
                 Err(err) => last_error = Some(err),
             }
         }
-        Err(last_error.unwrap_or_else(|| EngineError::internal("没有可用引擎")))
+        match last_error {
+            Some(err) => Err(err),
+            None => Ok(first_ok.unwrap_or_else(|| json!("OK"))),
+        }
     }
 }
 
@@ -709,10 +723,13 @@ impl RpcServerHandle {
 }
 
 /// 绑定并启动 6800 服务端。绑定失败在返回前就能看到（端口被占用等）。
+///
+/// `secret` 是**共享可变值**：用户改密钥时由 service 原地写入，本函数不重建监听器、
+/// 不断开既有连接（红线：改密钥不得中断当前下载）。
 pub async fn start_server(
     router: Arc<Router>,
     port: u16,
-    secret: String,
+    secret: Arc<StdMutex<String>>,
 ) -> std::io::Result<RpcServerHandle> {
     let listener = TcpListener::bind(("127.0.0.1", port)).await?;
     let (shutdown, mut shutdown_rx) = watch::channel(false);
@@ -729,7 +746,7 @@ pub async fn start_server(
                     match accepted {
                         Ok((stream, peer)) => {
                             let router = Arc::clone(&router);
-                            let secret = secret.clone();
+                            let secret = Arc::clone(&secret);
                             tokio::spawn(async move {
                                 if let Err(err) = serve_connection(router, secret, stream).await {
                                     tracing::debug!("[rpc] 客户端 {peer} 断开：{err}");
@@ -753,7 +770,7 @@ pub async fn start_server(
 
 async fn serve_connection(
     router: Arc<Router>,
-    secret: String,
+    secret: Arc<StdMutex<String>>,
     stream: tokio::net::TcpStream,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio_tungstenite::tungstenite::Message;
@@ -795,7 +812,13 @@ async fn serve_connection(
         let frame = frame?;
         match frame {
             Message::Text(text) => {
-                if let Some(response) = handle_request(&router, &secret, text.as_str()).await {
+                // 每请求读一次当前密钥：热更新后旧连接的下一条请求立即按新密钥鉴权，
+                // 连接本身不受影响（不断线、不重启监听器）。
+                let current = secret
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                if let Some(response) = handle_request(&router, &current, text.as_str()).await {
                     if out_tx.send(response).await.is_err() {
                         break;
                     }
@@ -920,6 +943,22 @@ mod tests {
         assert_eq!(
             route_add_uris(&uris(&["magnet:?xt=urn:btih:xx"]), EngineMode::Auto).unwrap(),
             EngineKind::Aria2
+        );
+    }
+
+    /// beta12.2 回归：插件分片（HLS 等纯 HTTP(S) 直链）在 auto 模式下必须路由到
+    /// native —— 否则 release 漏带 `native-http` 时会报「native 引擎未启用」。
+    #[test]
+    fn auto_routes_http_segments_to_native() {
+        let segments = uris(&[
+            "https://cdn.example.com/hls/seg-00001.ts",
+            "http://cdn.example.com/hls/seg-00002.ts?token=abc",
+            "https://cdn.example.com/hls/index.m3u8",
+        ]);
+        assert_eq!(
+            route_add_uris(&segments, EngineMode::Auto).unwrap(),
+            EngineKind::Native,
+            "纯 HTTP(S) 分片必须由 auto 路由到 native"
         );
     }
 
@@ -1095,5 +1134,84 @@ mod tests {
         assert_eq!(value["jsonrpc"], "2.0");
         assert_eq!(value["method"], "aria2.onDownloadComplete");
         assert_eq!(value["params"][0]["gid"], "fffe000000000001");
+    }
+
+    /// 第三方（非 UI）推到 6800 的 `aria2.addUri` 必须**立刻**向所有已连接的 WS
+    /// 客户端广播 `aria2.onDownloadStart` —— UI 的下载列表就靠这条通知秒级出卡片。
+    ///
+    /// 这里同时把 Router / native 引擎 / 转发器 / WS 服务端串成真实链路，
+    /// 用裸 WS 客户端扮演"第三方脚本"，避免只测单点函数却漏掉接线。
+    #[cfg(feature = "native-http")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn third_party_add_uri_broadcasts_start_to_ws_clients() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        // `start_server` 不回传 0 号端口的真实值，先探测一个空闲端口。
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let resolver = engine_net::dns::resolver::DnsResolver::new(
+            &engine_net::dns::resolver::DnsConfig::default(),
+        )
+        .unwrap();
+        let engine = Arc::new(engine_net::rpc::methods::Engine::new(resolver));
+        let native = Arc::new(crate::engine::NativeClient::new(Arc::clone(&engine)));
+        let router = Router::new(
+            EngineMode::Native,
+            StubClient::new("aria2", Ok(json!("stub"))) as Arc<dyn EngineClient>,
+            Some(native as Arc<dyn EngineClient>),
+        );
+        spawn_native_forwarder(Arc::clone(&engine), router.events());
+        let server = start_server(
+            Arc::clone(&router),
+            port,
+            Arc::new(StdMutex::new("s3".to_string())),
+        )
+        .await
+        .unwrap();
+
+        let (mut ws, _) =
+            tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/jsonrpc"))
+                .await
+                .unwrap();
+        let dir = std::env::temp_dir().to_string_lossy().into_owned();
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "method": "aria2.addUri",
+            "params": [
+                "token:s3",
+                ["http://127.0.0.1:9/beta8.2-push-probe.bin"],
+                { "dir": dir }
+            ]
+        });
+        ws.send(Message::text(request.to_string())).await.unwrap();
+
+        let mut seen: Option<String> = None;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            let Ok(Some(Ok(Message::Text(text)))) =
+                tokio::time::timeout_at(deadline, ws.next()).await
+            else {
+                continue;
+            };
+            let value: Value = serde_json::from_str(&text).unwrap();
+            // 先到的可能是 addUri 回执（带 id），只认通知帧。
+            if value.get("id").is_some() {
+                continue;
+            }
+            if value.get("method").and_then(Value::as_str) == Some("aria2.onDownloadStart") {
+                seen = value["params"][0]["gid"].as_str().map(str::to_string);
+                break;
+            }
+        }
+
+        assert!(
+            seen.as_deref().is_some_and(|gid| !gid.is_empty()),
+            "第三方 addUri 必须立即广播 aria2.onDownloadStart（带 gid）"
+        );
+        server.shutdown().await;
     }
 }

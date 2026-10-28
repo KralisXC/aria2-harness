@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>Aria2-Harness</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --accent: #00b4d8;
+        --accent-deep: #0077b6;
+        --bg: #f6f8fa;
+        --card: #ffffff;
+        --text: #1f2937;
+        --muted: #64748b;
+        --border: #e5e7eb;
+        --ok: #0f9d58;
+        --warn: #b45309;
+        --err: #dc2626;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #111827;
+          --card: #1b2432;
+          --text: #e5e7eb;
+          --muted: #9ca3af;
+          --border: #2d3748;
+        }
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        margin: 0;
+      }
+      body {
+        width: 344px;
+        padding: 14px;
+        background: var(--bg);
+        color: var(--text);
+        font: 13px/1.5 system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        margin-bottom: 12px;
+      }
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-weight: 700;
+        letter-spacing: 0.2px;
+      }
+      .dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        background: linear-gradient(135deg, var(--accent), var(--accent-deep));
+      }
+      .pill {
+        padding: 3px 9px;
+        border-radius: 999px;
+        font-size: 11px;
+        font-weight: 600;
+        border: 1px solid var(--border);
+        color: var(--muted);
+        white-space: nowrap;
+      }
+      .pill.on {
+        color: #ffffff;
+        background: var(--accent-deep);
+        border-color: transparent;
+      }
+      .pill.err {
+        color: #ffffff;
+        background: var(--err);
+        border-color: transparent;
+      }
+      .row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 10px 12px;
+        margin-bottom: 12px;
+      }
+      .row strong {
+        display: block;
+        font-size: 13px;
+      }
+      .row small {
+        color: var(--muted);
+        font-size: 11px;
+      }
+      .switch {
+        flex: none;
+        width: 42px;
+        height: 24px;
+        border-radius: 999px;
+        border: 0;
+        padding: 2px;
+        background: #cbd5e1;
+        cursor: pointer;
+        transition: background 0.15s ease;
+      }
+      .switch span {
+        display: block;
+        width: 20px;
+        height: 20px;
+        border-radius: 50%;
+        background: #ffffff;
+        transition: transform 0.15s ease;
+      }
+      .switch.on {
+        background: var(--accent-deep);
+      }
+      .switch.on span {
+        transform: translateX(18px);
+      }
+      .switch:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+      .primary {
+        width: 100%;
+        padding: 10px 12px;
+        border: 0;
+        border-radius: 10px;
+        cursor: pointer;
+        color: #ffffff;
+        font-family: inherit;
+        font-size: 13px;
+        font-weight: 600;
+        background: linear-gradient(135deg, var(--accent), var(--accent-deep));
+        box-shadow: 0 6px 16px rgba(0, 119, 182, 0.25);
+      }
+      .primary:disabled {
+        opacity: 0.6;
+        cursor: default;
+        box-shadow: none;
+      }
+      .result {
+        margin: 10px 2px 0;
+        min-height: 34px;
+        color: var(--muted);
+        font-size: 12px;
+        word-break: break-word;
+      }
+      .result.ok {
+        color: var(--ok);
+      }
+      .result.warn {
+        color: var(--warn);
+      }
+      .result.err {
+        color: var(--err);
+      }
+      footer {
+        margin-top: 10px;
+        padding-top: 8px;
+        border-top: 1px solid var(--border);
+        color: var(--muted);
+        font-size: 11px;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="brand"><span class="dot"></span><span>Aria2-Harness</span></div>
+      <span id="state" class="pill">检测中</span>
+    </header>
+
+    <section class="row">
+      <div>
+        <strong>接管浏览器下载</strong>
+        <small>关闭后使用浏览器原生下载</small>
+      </div>
+      <button
+        id="toggle"
+        class="switch"
+        type="button"
+        role="switch"
+        aria-checked="true"
+        aria-label="接管浏览器下载"
+      >
+        <span></span>
+      </button>
+    </section>
+
+    <button id="parse" class="primary" type="button">解析当前页面</button>
+    <p id="result" class="result" role="status" aria-live="polite">
+      抓取页面全息包，唤醒命中的站点插件。
+    </p>
+
+    <footer>命中站点插件时，页面内会出现悬浮下载按钮。</footer>
+    <script src="popup.js"></script>
+  </body>
+</html>

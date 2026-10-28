@@ -29,10 +29,13 @@ use crate::error::AppError;
 use crate::host::HostContext;
 
 use super::dispatcher::{self, PluginJob, Subscriber};
+use super::holo;
 use super::hostapi::{HostBridge, PluginHostContext};
-use super::manifest::{Manifest, SettingSpec};
+use super::manifest::{ActionSpec, Manifest, RoutingRule, SettingSpec};
+use super::plugin_tasks::PluginTask;
 use super::registry::Registry;
 use super::runtime::{self, PluginRuntime};
+use super::task_router::{self, RouteEntry};
 use super::QUEUE_CAP;
 
 /// 单插件同步加载的超时上界。
@@ -43,6 +46,10 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(2000);
 const BREAKER_THRESHOLD: usize = 3;
 /// 热重载防抖窗口：变更后静默这么长时间才批量重载（合并编辑器保存产生的多个事件）。
 const RELOAD_DEBOUNCE: Duration = Duration::from_millis(300);
+/// `onTaskDetected` 的同步回执上界（契约：3 秒内必须返回 claim 决策）。
+const DETECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// 取消 hook 的预算（清理动作应快速完成）。
+const CANCEL_BUDGET_MS: u64 = 5_000;
 
 /// 监听线程的退出标志。退出期由 [`stop_watching`] 置位，监听线程在下一个静默
 /// 窗口（≤ `RELOAD_DEBOUNCE`）内自行收敛退出。
@@ -74,6 +81,14 @@ pub struct PluginInfo {
     pub name: String,
     pub version: String,
     pub description: String,
+    /// 作者（beta11 · A5：卡片与详情展示）。
+    pub author: String,
+    /// 图标（beta11 · A6：已转成 data URI；读失败 / 超限为 `None`）。
+    pub icon: Option<String>,
+    /// 入口脚本（相对插件根目录，详情弹窗展示）。
+    pub entry: String,
+    /// 右键动作声明（beta11 · FF-4：仅已完成任务展示）。
+    pub actions: Vec<ActionSpec>,
     /// 运行开关当前值（禁用 = 挂起，线程存活但不再派发事件）。
     pub enabled: bool,
     pub priority: i64,
@@ -101,21 +116,63 @@ pub struct PluginSettingView {
     pub value: Value,
 }
 
+/// 共享组件的前端视图（beta12.2：`data/plugins/.shared/<id>/`）。
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SharedInfo {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    pub author: String,
+    /// 落盘目录（绝对路径，详情展示用）。
+    pub dir: String,
+    /// 递归统计的文件数（FFmpeg 共享包 = exe + DLL 等）。
+    pub file_count: usize,
+}
+
+/// 一次成功 claim 的结果（`add_download` 据此创建虚拟任务并投递 `onTaskRun`）。
+#[derive(Clone, Debug)]
+pub struct TaskClaim {
+    pub plugin_id: String,
+    /// 插件返回的展示标题；空时由调用方回退到 URL 文件名。
+    pub title: String,
+}
+
 struct LoadedPlugin {
     id: String,
     name: String,
     version: String,
     description: String,
+    /// beta11：manifest 元数据（卡片 / 详情展示）。
+    author: String,
+    /// 已解析的图标 data URI（加载期算一次，`list()` 不再读盘）。
+    icon: Option<String>,
+    entry: String,
+    actions: Vec<ActionSpec>,
     permissions: Vec<String>,
     /// manifest 声明的设置 schema（前端表单渲染依据）。
     setting_specs: Vec<SettingSpec>,
     /// 运行时设置快照：与 `PluginHostContext.settings` 共享同一 `Arc`，
     /// 保存后立即对 `ctx.settings.get()` 生效，无需重载插件。
     settings: Arc<RwLock<HashMap<String, Value>>>,
+    /// 已授权能力快照（与 `PluginHostContext.granted` 共享同一 `Arc`）。
+    ///
+    /// 与 manifest 的 `permissions`（"申请了什么"）不同，这里记录的是"用户同意了什么"；
+    /// `exec:local` 等敏感能力要求两者同时具备。授权 → 原地写穿，无需重载。
+    granted: Arc<RwLock<HashSet<String>>>,
     /// 插件所在目录（热重载按目录定位实例：`notify` 给出的是路径而非 id）。
     dir: PathBuf,
     tx: SyncSender<PluginJob>,
     hooks: Arc<HashSet<String>>,
+    /// manifest.routing（beta10 任务路由）。
+    routing: Vec<RoutingRule>,
+    /// 懒激活域名规则（beta12 · 模块 E）；空 = 始终激活。
+    activation: Vec<String>,
+    /// 当前是否已被全息探针唤醒（仅内存，重启 / 热重载后回到休眠）。
+    activated: Arc<AtomicBool>,
+    /// 长任务预算（`onTaskRun`）。
+    task_timeout_ms: u64,
     /// 运行开关：与 `Subscriber` 共享同一 `Arc`，UI 切换即时生效。
     enabled: Arc<AtomicBool>,
     priority: i64,
@@ -138,7 +195,16 @@ impl PluginManager {
             Ok(entries) => entries
                 .flatten()
                 .map(|entry| entry.path())
-                .filter(|path| path.is_dir())
+                // beta11 · C5：`configs` 是配置目录，点目录是安装 / 备份临时目录，
+                // 都不是插件 —— 扫描时直接跳过（否则会被当成"缺 manifest 的插件"）。
+                .filter(|path| {
+                    path.is_dir()
+                        && path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .map(|name| !is_non_plugin_dir_name(name))
+                            .unwrap_or(false)
+                })
                 .collect(),
             Err(e) => {
                 eprintln!("[plugin] 读取插件目录失败（{}）：{e}", dir.display());
@@ -200,6 +266,7 @@ impl PluginManager {
                     priority: p.priority,
                     hooks: p.hooks.clone(),
                     enabled: p.enabled.clone(),
+                    activated: p.activated.clone(),
                     tx: p.tx.clone(),
                 })
                 .collect()
@@ -221,6 +288,262 @@ impl PluginManager {
             .clone()
     }
 
+    /// 当前启用插件的路由表（按优先级仲裁）。
+    fn route_entries(&self) -> Vec<RouteEntry> {
+        let plugins = self
+            .plugins
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        plugins
+            .iter()
+            .filter(|plugin| plugin.enabled.load(Ordering::Relaxed))
+            .flat_map(|plugin| {
+                plugin.routing.iter().map(|rule| RouteEntry {
+                    plugin_id: plugin.id.clone(),
+                    plugin_priority: plugin.priority,
+                    pattern: rule.pattern.clone(),
+                    priority: rule.priority,
+                    handler: rule.handler.clone(),
+                })
+            })
+            .collect()
+    }
+
+    fn plugin_sender(&self, plugin_id: &str) -> Option<(SyncSender<PluginJob>, u64)> {
+        let plugins = self
+            .plugins
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        plugins
+            .iter()
+            .find(|plugin| {
+                plugin.id == plugin_id
+                    && plugin.enabled.load(Ordering::Relaxed)
+                    // beta12 · 模块 E：休眠插件不参与认领 / 长任务。
+                    && plugin.activated.load(Ordering::Relaxed)
+            })
+            .map(|plugin| (plugin.tx.clone(), plugin.task_timeout_ms))
+    }
+
+    /// 有效域名规则：`manifest.activationEvents.domains` ∪ 用户自定义域名。
+    ///
+    /// beta12.4：每次匹配都从**运行期设置快照**读取 `custom_domains`，
+    /// 因此前端保存后即刻生效（无需重启、无需重载插件）；设置本身与
+    /// `data/plugins/configs/<id>.json` 严格一致（见 [`Self::update_settings`]）。
+    fn domains_of(plugin: &LoadedPlugin) -> Vec<String> {
+        let custom = plugin
+            .settings
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(holo::SETTING_CUSTOM_DOMAINS)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        holo::merge_domains(&plugin.activation, &custom)
+    }
+
+    /// 仅查询某主机被哪些**站点插件**声明（`GET /check`），**不改变激活状态**。
+    ///
+    /// 与 [`Self::dispatch_holo`] 的差异：这里刻意排除 `activationEvents` 为空的
+    /// 始终激活插件，否则扩展会在百度等普通网页上也注入站点悬浮按钮。
+    pub fn match_holo(&self, host: &str) -> Vec<String> {
+        let plugins = self
+            .plugins
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let table: Vec<(String, Vec<String>)> = plugins
+            .iter()
+            .filter(|plugin| plugin.enabled.load(Ordering::Relaxed))
+            .map(|plugin| (plugin.id.clone(), Self::domains_of(plugin)))
+            .collect();
+        let mut ids: Vec<String> = holo::match_site_plugins(
+            host,
+            table
+                .iter()
+                .map(|(id, patterns)| (id.as_str(), patterns.as_slice())),
+        )
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        ids.sort();
+        ids
+    }
+
+    /// 接收全息探针（beta12 · 模块 E）：只唤醒域名命中的插件。
+    ///
+    /// 未命中 ⇒ 保持休眠；命中 ⇒ 置 `activated=true`，并在插件声明了 `onHolo`
+    /// 时投递 `{hook:"onHolo", packet}`。返回命中的插件 id（升序）。
+    pub fn dispatch_holo(&self, packet: &holo::HoloPacket) -> Vec<String> {
+        let plugins = self
+            .plugins
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let table: Vec<(String, Vec<String>)> = plugins
+            .iter()
+            .filter(|plugin| plugin.enabled.load(Ordering::Relaxed))
+            .map(|plugin| (plugin.id.clone(), Self::domains_of(plugin)))
+            .collect();
+        let mut matched_ids: Vec<String> = holo::match_plugins(
+            packet.host.as_str(),
+            table
+                .iter()
+                .map(|(id, patterns)| (id.as_str(), patterns.as_slice())),
+        )
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        matched_ids.sort();
+        let matched: HashSet<String> = matched_ids.iter().cloned().collect();
+
+        for plugin in plugins.iter() {
+            if !matched.contains(plugin.id.as_str()) {
+                continue;
+            }
+            plugin.activated.store(true, Ordering::Relaxed);
+            if !plugin.hooks.contains(holo::HOOK_HOLO) {
+                continue;
+            }
+            let payload = json!({ "hook": holo::HOOK_HOLO, "packet": packet });
+            match plugin.tx.try_send(PluginJob::Hook {
+                hook: holo::HOOK_HOLO.to_string(),
+                payload,
+            }) {
+                Ok(()) => {}
+                Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                    eprintln!("[plugin:{}] 队列已满，丢弃全息探针", plugin.id);
+                    super::audit::log_dropped_event(&plugin.id, holo::HOOK_HOLO);
+                    crate::metrics::METRICS
+                        .plugin_dropped
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
+            }
+        }
+        matched_ids
+    }
+
+    /// 询问路由命中的插件是否接管该 URL（契约：3 秒内返回 `{claim}`）。
+    ///
+    /// 未命中 / 插件繁忙 / 超时 / 返回 `claim:false` 一律返回 `None`，
+    /// 调用方继续走既有的前置拦截链路。
+    pub fn claim_task(&self, url: &str, options: &Value) -> Option<TaskClaim> {
+        let entries = self.route_entries();
+        let route = task_router::match_route(&entries, url)?.clone();
+        let (tx, _) = self.plugin_sender(&route.plugin_id)?;
+
+        let payload = json!({
+            "hook": route.handler,
+            "url": url,
+            "options": options,
+        });
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        // 非阻塞投递：插件正忙于长任务时直接放行到原有链路，绝不让 IPC 卡满 3 秒。
+        if tx
+            .try_send(PluginJob::Detect {
+                hook: route.handler,
+                payload,
+                budget_ms: DETECT_TIMEOUT.as_millis() as u64,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            return None;
+        }
+
+        match reply_rx.recv_timeout(DETECT_TIMEOUT) {
+            Ok(Ok(Some(value))) if value.get("claim").and_then(Value::as_bool) == Some(true) => {
+                let title = value
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                Some(TaskClaim {
+                    plugin_id: route.plugin_id,
+                    title,
+                })
+            }
+            Ok(Ok(_)) => None,
+            Ok(Err(e)) => {
+                eprintln!(
+                    "[plugin:{}] onTaskDetected 失败，回退普通下载链路：{e}",
+                    route.plugin_id
+                );
+                None
+            }
+            Err(_) => {
+                eprintln!(
+                    "[plugin:{}] onTaskDetected 超时（{}s），回退普通下载链路",
+                    route.plugin_id,
+                    DETECT_TIMEOUT.as_secs()
+                );
+                None
+            }
+        }
+    }
+
+    /// 投递长任务 hook（`onTaskRun`）；预算取 manifest `limits.taskTimeoutMs`。
+    pub fn run_plugin_task(
+        &self,
+        plugin_id: &str,
+        hook: &str,
+        payload: Value,
+    ) -> Result<(), AppError> {
+        let (tx, budget_ms) = self.plugin_sender(plugin_id).ok_or_else(|| {
+            AppError::InvalidArgs(format!("插件不可用或已禁用：{plugin_id}"))
+        })?;
+        tx.try_send(PluginJob::TaskHook {
+            hook: hook.to_string(),
+            payload,
+            budget_ms,
+        })
+        .map_err(|_| AppError::Internal(format!("插件任务队列已满：{plugin_id}")))
+    }
+
+    /// 取消虚拟任务：先中断该插件正在等待的批量下载，再投递 `onTaskCancel` 做清理。
+    pub fn cancel_plugin_task(&self, task_id: &str) -> Result<PluginTask, AppError> {
+        let plugin_id = super::plugin_tasks::plugin_of(task_id)
+            .ok_or_else(|| AppError::InvalidArgs(format!("未找到插件任务：{task_id}")))?;
+        let task = super::plugin_tasks::get(task_id).ok_or_else(|| {
+            AppError::InvalidArgs(format!("未找到插件任务：{task_id}"))
+        })?;
+
+        // 中断 `addTasksAndWait`：否则插件线程仍卡在长任务上，取消要等 30 分钟才生效。
+        super::tasks::cancel(&plugin_id);
+        // beta11 · B4：强杀该插件已 spawn 的 FFmpeg / FFprobe（录制 / 转码）。
+        // 临时分片目录的清理仍交给插件的 onTaskCancel（宿主不猜路径）。
+        super::exec::kill_plugin(&plugin_id);
+        let cancelled = super::plugin_tasks::cancel(task_id).unwrap_or(task);
+
+        if let Some((tx, _)) = self.plugin_sender(&plugin_id) {
+            let payload = json!({
+                "hook": "onTaskCancel",
+                "task": {
+                    "id": cancelled.id,
+                    "title": cancelled.title,
+                    "url": cancelled.url,
+                }
+            });
+            if tx
+                .try_send(PluginJob::TaskHook {
+                    hook: "onTaskCancel".to_string(),
+                    payload,
+                    budget_ms: CANCEL_BUDGET_MS,
+                })
+                .is_err()
+            {
+                tracing::warn!("取消 hook 未送达（插件队列已满）：plugin={plugin_id}");
+            }
+        }
+
+        if self.host.frontend_alive() {
+            self.host.emit(
+                "plugin://task",
+                json!({ "pluginId": plugin_id, "task": cancelled }),
+            );
+        }
+        Ok(cancelled)
+    }
+
     /// 加载单个插件；返回 `(插件, 是否改动授权账本)`。
     fn load_one(
         host: &Arc<dyn HostContext>,
@@ -236,9 +559,19 @@ impl PluginManager {
         let (enabled, mutated) = Self::decide_enabled(&manifest, registry);
 
         // 设置快照：manifest 默认值 ← 用户已保存值（只接受 schema 中声明的 key）。
-        let settings = merge_settings(&manifest, &registry.settings_of(&manifest.id));
+        //
+        // beta11 · C3：优先读 `plugins/configs/<id>.json`；旧版本把设置存在
+        // registry.json 里，读不到配置文件时回退账本（兼容升级后的存量用户）。
+        let stored = Self::read_config(&manifest.id)
+            .unwrap_or_else(|| registry.settings_of(&manifest.id));
+        let settings = merge_settings(&manifest, &stored);
+        // 授权快照：首次加载由 `decide_enabled` 写入全部权限，这里读到的即最终快照。
+        let granted: HashSet<String> = registry
+            .record(&manifest.id)
+            .map(|rec| rec.granted_permissions.iter().cloned().collect())
+            .unwrap_or_default();
 
-        let plugin = Self::build_plugin(host, bridge, dir, &manifest, enabled, settings)?;
+        let plugin = Self::build_plugin(host, bridge, dir, &manifest, enabled, settings, granted)?;
         println!(
             "[plugin] 已加载 {} v{}（{}，优先级 {}，hooks {} 个）{}",
             manifest.name,
@@ -298,18 +631,23 @@ impl PluginManager {
         manifest: &Manifest,
         enabled: bool,
         settings: HashMap<String, Value>,
+        granted: HashSet<String>,
     ) -> Result<LoadedPlugin, AppError> {
         let entry_path = dir.join(&manifest.entry);
         // 按 engine 分流读取：JS 走 UTF-8 文本，Wasm 走二进制（增量 25）。
         let source = runtime::read_entry(&manifest.engine, &entry_path)?;
 
         let settings = Arc::new(RwLock::new(settings));
+        let granted = Arc::new(RwLock::new(granted));
         let host_ctx = PluginHostContext {
             plugin_id: manifest.id.clone(),
             permissions: Arc::new(manifest.permission_set()),
+            granted: granted.clone(),
             settings: settings.clone(),
             host: host.clone(),
             bridge: bridge.clone(),
+            limits: manifest.limits.clone(),
+            plugin_dir: dir.to_path_buf(),
         };
 
         // 专属线程 + 有界队列
@@ -321,6 +659,9 @@ impl PluginManager {
         let enabled_flag = Arc::new(AtomicBool::new(enabled));
         let failures = Arc::new(AtomicUsize::new(0));
         let breaker = Arc::new(AtomicBool::new(false));
+        // beta12 · 模块 E：无 activationEvents ⇒ 始终保持激活（既有插件零感知）。
+        let activation = manifest.activation_events.domains.clone();
+        let activated_flag = Arc::new(AtomicBool::new(activation.is_empty()));
         let thread_enabled = enabled_flag.clone();
         let thread_failures = failures.clone();
         let thread_breaker = breaker.clone();
@@ -370,12 +711,22 @@ impl PluginManager {
             name: manifest.name.clone(),
             version: manifest.version.clone(),
             description: manifest.description.clone(),
+            author: manifest.author.clone(),
+            // beta11 · A6：图标在此一次性转 data URI（读失败 / 超 256KB → None）。
+            icon: icon_data_uri(dir, manifest.icon.as_deref()),
+            entry: manifest.entry.clone(),
+            actions: manifest.actions.clone(),
             permissions: manifest.permissions.clone(),
             setting_specs: manifest.settings.clone(),
             settings,
+            granted,
             dir: dir.to_path_buf(),
             tx,
             hooks: Arc::new(manifest.hooks.iter().cloned().collect()),
+            routing: manifest.routing.clone(),
+            activation,
+            activated: activated_flag,
+            task_timeout_ms: manifest.limits.task_timeout_ms,
             // 启用态取自授权账本（首次加载=启用；新增未授权权限=禁用）。
             enabled: enabled_flag,
             priority: manifest.priority,
@@ -406,6 +757,10 @@ impl PluginManager {
                     name: p.name.clone(),
                     version: p.version.clone(),
                     description: p.description.clone(),
+                    author: p.author.clone(),
+                    icon: p.icon.clone(),
+                    entry: p.entry.clone(),
+                    actions: p.actions.clone(),
                     enabled: p.enabled.load(Ordering::Relaxed),
                     priority: p.priority,
                     hooks,
@@ -442,6 +797,78 @@ impl PluginManager {
             .collect()
     }
 
+    /// 共享组件列表（beta12.2）：扫描 `.shared/<id>/manifest.json`。
+    ///
+    /// 解析失败 / `type` 非 `shared` 的目录直接跳过（不报错：点目录是安装 / 备份残留）。
+    pub fn list_shared(&self) -> Vec<SharedInfo> {
+        let root = super::install::shared_root();
+        let mut dirs: Vec<PathBuf> = match std::fs::read_dir(&root) {
+            Ok(entries) => entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir())
+                .collect(),
+            Err(_) => return Vec::new(),
+        };
+        dirs.sort();
+
+        let mut out = Vec::new();
+        for dir in dirs {
+            let name = dir.file_name().and_then(|value| value.to_str()).unwrap_or("");
+            if name.starts_with('.') || !dir.join("manifest.json").is_file() {
+                continue;
+            }
+            let manifest = match Manifest::from_dir(&dir) {
+                Ok(manifest) => manifest,
+                Err(_) => continue,
+            };
+            if manifest.plugin_type != super::manifest::TYPE_SHARED {
+                continue;
+            }
+            out.push(SharedInfo {
+                id: manifest.id,
+                name: manifest.name,
+                version: manifest.version,
+                description: manifest.description,
+                author: manifest.author,
+                dir: dir.to_string_lossy().into_owned(),
+                file_count: count_files(&dir),
+            });
+        }
+        out
+    }
+
+    /// 卸载共享组件（beta12.2）：删 `.shared/<id>` 目录并通知前端刷新。
+    ///
+    /// 路径安全：`canonicalize` 后必须仍是 `.shared` 的子目录（防目录穿越 / 符号链接）。
+    pub fn uninstall_shared(&self, id: &str) -> Result<(), AppError> {
+        if !super::manifest::is_valid_plugin_id(id) {
+            return Err(AppError::InvalidArgs(format!("非法共享包 id：{id}")));
+        }
+        let root = super::install::shared_root();
+        let root_real = std::fs::canonicalize(&root).map_err(|e| {
+            AppError::fs(format!("共享包目录不存在（{}）", root.display()), e)
+        })?;
+        let target = root.join(id);
+        let target_real = std::fs::canonicalize(&target).map_err(|e| {
+            AppError::fs(format!("共享组件不存在（{}）", target.display()), e)
+        })?;
+        if target_real == root_real || !target_real.starts_with(&root_real) {
+            return Err(AppError::InvalidArgs(format!(
+                "共享包路径越界，拒绝卸载：{id}"
+            )));
+        }
+        std::fs::remove_dir_all(&target_real)
+            .map_err(|e| AppError::fs(format!("删除共享包失败（{}）", target.display()), e))?;
+
+        self.host.emit(
+            "plugin://reloaded",
+            json!({ "id": id, "status": "uninstalled", "shared": true }),
+        );
+        println!("[plugin] 已卸载共享组件 {id}");
+        Ok(())
+    }
+
     /// 运行时启停：置位共享的 `AtomicBool`（dispatch 阶段即时生效，挂起语义），
     /// 并把新状态与授权快照落盘到 `registry.json`。
     ///
@@ -452,7 +879,7 @@ impl PluginManager {
     /// （返回 `Err`）—— 必须由前端弹窗展示权限后走 [`Self::grant_permissions`]，杜绝静默提权。
     pub fn set_enabled(&self, id: &str, enabled: bool) -> Result<(), AppError> {
         // 仅在 plugins 锁内取快照，随后释放；避免持锁做落盘。
-        let (flag, breaker, failures, manifest_perms, name) = {
+        let (flag, breaker, failures, manifest_perms, name, granted) = {
             let plugins = self
                 .plugins
                 .lock()
@@ -467,6 +894,7 @@ impl PluginManager {
                 plugin.failures.clone(),
                 plugin.permissions.clone(),
                 plugin.name.clone(),
+                plugin.granted.clone(),
             )
         };
 
@@ -487,6 +915,15 @@ impl PluginManager {
         }
 
         flag.store(enabled, Ordering::Relaxed);
+        // beta10：禁用立即取消该插件正在进行的批量任务；重新启用则清除取消标记。
+        if enabled {
+            super::tasks::clear_cancel(id);
+        } else {
+            super::tasks::cancel(id);
+            super::plugin_tasks::cancel_all_for_plugin(id);
+            // beta11 · B4：禁用即挂起 —— 一并强杀该插件正在跑的 FFmpeg。
+            super::exec::kill_plugin(id);
+        }
         // 用户任一启停操作都视为"给插件一次重新机会"：清空熔断标记与连续失败计数。
         breaker.store(false, Ordering::Relaxed);
         failures.store(0, Ordering::Relaxed);
@@ -500,6 +937,10 @@ impl PluginManager {
             guard.set_enabled(id, enabled);
             if enabled {
                 guard.grant(id, &manifest_perms);
+                // 授权快照同步写穿到运行时：`ctx.exec` 的 `exec:local` 判定立即可见，
+                // 不必重载插件（用户确认即生效）。
+                *granted.write().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    manifest_perms.iter().cloned().collect();
             }
             if let Err(e) = guard.save(&self.registry_dir) {
                 eprintln!("[plugin] 持久化 registry 失败：{e}");
@@ -519,7 +960,7 @@ impl PluginManager {
     /// 与 [`Self::set_enabled`] 的区别：跳过"新增未授权权限"拦截，直接授权并启用
     /// —— 这正是 P0-A 授权可解释性的闭环动作（用户已看清权限清单并同意）。
     pub fn grant_permissions(&self, id: &str) -> Result<(), AppError> {
-        let (flag, breaker, failures, manifest_perms, name) = {
+        let (flag, breaker, failures, manifest_perms, name, granted) = {
             let plugins = self
                 .plugins
                 .lock()
@@ -534,10 +975,12 @@ impl PluginManager {
                 plugin.failures.clone(),
                 plugin.permissions.clone(),
                 plugin.name.clone(),
+                plugin.granted.clone(),
             )
         };
 
         flag.store(true, Ordering::Relaxed);
+        super::tasks::clear_cancel(id);
         breaker.store(false, Ordering::Relaxed);
         failures.store(0, Ordering::Relaxed);
 
@@ -548,6 +991,9 @@ impl PluginManager {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             guard.grant(id, &manifest_perms);
             guard.set_enabled(id, true);
+            // 与 `set_enabled` 同理：授权快照即时写穿，`exec:local` 无需重载即生效。
+            *granted.write().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                manifest_perms.iter().cloned().collect();
             if let Err(e) = guard.save(&self.registry_dir) {
                 eprintln!("[plugin] 持久化 registry 失败：{e}");
             }
@@ -561,13 +1007,13 @@ impl PluginManager {
         Ok(())
     }
 
-    /// 保存插件设置：校验 schema → 写 registry.json → **热更新运行时快照**。
+    /// 保存插件设置：校验 schema → 写 `plugins/configs/<id>.json` → **热更新运行时快照**。
     ///
     /// 红线：
     /// - 只接受 manifest.settings 中声明过的 key，杜绝插件/前端写入任意垃圾数据；
     /// - 类型与 select 候选值必须匹配，否则拒绝整次保存（不做部分写入）；
     /// - 落盘成功后才更新运行时，保证 `ctx.settings.get()` 与磁盘绝对一致；
-    /// - 持锁范围：快照 → 释放；registry 落盘；最后写 settings 单元。
+    /// - 持锁范围：快照 → 释放；配置文件落盘；最后写 settings 单元。
     pub fn update_settings(
         &self,
         id: &str,
@@ -601,7 +1047,10 @@ impl PluginManager {
             })?;
             match spec.kind.as_str() {
                 "boolean" if value.is_boolean() => {}
-                "string" if value.is_string() => {}
+                // `text` / `textarea` 与 `string` 同一套类型校验（前端只换控件）。
+                "string" | "textarea" | "text" if value.is_string() => {}
+                // 1.0.0-rc1 · 模块二：`number` 只接受 JSON 数字（字符串形式的数字同样拒绝）。
+                "number" if value.is_number() => {}
                 "select" => {
                     let text = value.as_str().ok_or_else(|| {
                         AppError::InvalidArgs(format!("设置项 {key} 必须为字符串"))
@@ -633,19 +1082,117 @@ impl PluginManager {
         }
 
         {
-            let mut registry = self
-                .registry
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            registry.set_settings(id, next.clone());
-            registry
-                .save(&self.registry_dir)
-                .map_err(|e| AppError::Internal(format!("保存插件设置失败：{e}")))?;
+            // beta11 · C4：设置写 `plugins/configs/<id>.json`（tmp + rename 原子替换），
+            // 不再写 registry.settings（该字段仅保留读取兼容）。
+            Self::write_config(id, &next)?;
         }
 
         *cell.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = next;
 
         println!("[plugin] {} 的设置已更新（{} 项）", name, specs.len());
+        Ok(())
+    }
+
+    /// 插件配置文件：`data/plugins/configs/<id>.json`（beta11 · C2）。
+    fn config_file(id: &str) -> PathBuf {
+        crate::paths::plugin_configs_dir().join(format!("{id}.json"))
+    }
+
+    /// 读取已保存设置；id 非法 / 文件缺失 / 解析失败一律 `None`（调用方回退 registry）。
+    fn read_config(id: &str) -> Option<HashMap<String, Value>> {
+        if !super::manifest::is_valid_plugin_id(id) {
+            return None;
+        }
+        let text = std::fs::read_to_string(Self::config_file(id)).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+
+    /// 写入设置：`create_dir_all(configs)` → `<id>.json.tmp` → `rename` 原子替换。
+    fn write_config(id: &str, values: &HashMap<String, Value>) -> Result<(), AppError> {
+        if !super::manifest::is_valid_plugin_id(id) {
+            return Err(AppError::InvalidArgs(format!("非法插件 id：{id}")));
+        }
+        let dir = crate::paths::plugin_configs_dir();
+        std::fs::create_dir_all(&dir).map_err(|e| {
+            AppError::fs(format!("创建插件配置目录失败（{}）", dir.display()), e)
+        })?;
+        let path = Self::config_file(id);
+        let tmp = dir.join(format!("{id}.json.tmp"));
+        let text = serde_json::to_string_pretty(values)?;
+        std::fs::write(&tmp, text).map_err(|e| {
+            AppError::fs(format!("写入插件配置失败（{}）", tmp.display()), e)
+        })?;
+        std::fs::rename(&tmp, &path)
+            .map_err(|e| AppError::fs(format!("替换插件配置失败（{}）", path.display()), e))
+    }
+
+    /// 删除设置文件（卸载时调用；文件不存在视为成功）。
+    fn delete_config(id: &str) {
+        if !super::manifest::is_valid_plugin_id(id) {
+            return;
+        }
+        let path = Self::config_file(id);
+        if let Err(e) = std::fs::remove_file(&path) {
+            if path.exists() {
+                tracing::warn!("删除插件配置失败（{}）：{e}", path.display());
+            }
+        }
+    }
+
+    /// 卸载插件（beta11 · B13/B14）：摘实例 → 关闭线程（含强杀）→ 删目录 →
+    /// 删配置 → 清授权账本 → 通知前端。
+    ///
+    /// 顺序红线：先摘实例再 join（join 有界等待，**不持任何锁**），避免卸载过程中
+    /// 仍有事件派发进旧插件；删目录失败时直接返回错误（配置与账本保持原样，可重试）。
+    pub fn uninstall(&self, id: &str) -> Result<(), AppError> {
+        if !super::manifest::is_valid_plugin_id(id) {
+            return Err(AppError::InvalidArgs(format!("非法插件 id：{id}")));
+        }
+
+        let removed = {
+            let mut plugins = self
+                .plugins
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            plugins
+                .iter()
+                .position(|plugin| plugin.id == id)
+                .map(|index| plugins.remove(index))
+        };
+        let dir = match removed {
+            Some(plugin) => {
+                let dir = plugin.dir.clone();
+                // shutdown_one 内含 kill_plugin + 有界 join（此刻不持任何锁）。
+                shutdown_one(plugin);
+                dir
+            }
+            // 实例不在内存（加载失败 / 尚未加载）：按 id 推导落盘目录。
+            None => super::install::plugin_dir_for(id),
+        };
+        self.refresh_subs();
+
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).map_err(|e| {
+                AppError::fs(format!("删除插件目录失败（{}）", dir.display()), e)
+            })?;
+        }
+
+        Self::delete_config(id);
+        {
+            let mut registry = self
+                .registry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            registry.remove(id);
+            if let Err(e) = registry.save(&self.registry_dir) {
+                eprintln!("[plugin] 持久化 registry 失败：{e}");
+            }
+        }
+
+        // 沿用热重载通道通知前端（status=uninstalled），前端据此重拉列表。
+        self.host
+            .emit("plugin://reloaded", json!({ "id": id, "status": "uninstalled" }));
+        println!("[plugin] 已卸载 {id}");
         Ok(())
     }
 
@@ -673,7 +1220,11 @@ impl PluginManager {
         let id = manifest.id.clone();
 
         // 2. 授权决策（仅持 registry 锁）
-        let (enabled, settings) = {
+        //
+        // beta11 · C3：设置优先读 `configs/<id>.json`（热重载不覆盖用户配置），
+        // 读不到（旧版本 / 从未保存过）再回退 registry.settings。
+        let stored_config = Self::read_config(&manifest.id);
+        let (enabled, settings, granted) = {
             let mut registry = self
                 .registry
                 .lock()
@@ -684,13 +1235,27 @@ impl PluginManager {
                     eprintln!("[plugin] 持久化 registry 失败：{e}");
                 }
             }
-            let settings = merge_settings(&manifest, &registry.settings_of(&manifest.id));
-            (enabled, settings)
+            let stored = stored_config
+                .clone()
+                .unwrap_or_else(|| registry.settings_of(&manifest.id));
+            let settings = merge_settings(&manifest, &stored);
+            let granted: HashSet<String> = registry
+                .record(&manifest.id)
+                .map(|rec| rec.granted_permissions.iter().cloned().collect())
+                .unwrap_or_default();
+            (enabled, settings, granted)
         };
 
         // 3. 构建新实例（无锁；内含线程 spawn + 3s Load 超时，失败即回收半成品线程）
-        let new_plugin =
-            Self::build_plugin(&self.host, &self.bridge, dir, &manifest, enabled, settings)?;
+        let new_plugin = Self::build_plugin(
+            &self.host,
+            &self.bridge,
+            dir,
+            &manifest,
+            enabled,
+            settings,
+            granted,
+        )?;
 
         // 4. 原子替换（锁序：plugins → subs）
         let old = {
@@ -713,6 +1278,8 @@ impl PluginManager {
         if let Some(prev) = old {
             shutdown_one(prev);
         }
+        // beta10：热重载后新实例沿用同一 id，必须清掉 shutdown_one 设置的取消标记。
+        super::tasks::clear_cancel(&id);
 
         // 6. 审计 + 通知前端
         let status = if !enabled {
@@ -752,6 +1319,86 @@ impl PluginManager {
             shutdown_one(plugin);
         }
     }
+}
+
+/// 插件图标上限（beta11 · A6）：超过即视为无效，避免把大图塞进 IPC。
+const ICON_MAX_BYTES: u64 = 256 * 1024;
+
+/// 插件根目录下的"非插件"目录名：`configs`（配置）与点目录（安装 / 备份临时目录）。
+fn is_non_plugin_dir_name(name: &str) -> bool {
+    name == "configs" || name.starts_with('.')
+}
+
+/// 递归统计目录内文件数（beta12.2：共享组件卡片展示 `fileCount`）。
+fn count_files(dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut total = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            total += count_files(&path);
+        } else if path.is_file() {
+            total += 1;
+        }
+    }
+    total
+}
+
+/// 图标路径 -> data URI（beta11 · A6）。
+///
+/// 约束：只认常见位图 / 矢量后缀；文件必须存在、是普通文件且不超过 256KB；
+/// 任何读失败 / 越界一律**静默返回 `None`**（前端回退首字母色块）。
+fn icon_data_uri(dir: &Path, icon: Option<&str>) -> Option<String> {
+    let rel = icon.map(str::trim).filter(|text| !text.is_empty())?;
+    let ext = Path::new(rel)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())?;
+    let mime = match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "gif" => "image/gif",
+        _ => return None,
+    };
+    let path = dir.join(rel);
+    let meta = std::fs::metadata(&path).ok()?;
+    if !meta.is_file() || meta.len() > ICON_MAX_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(&path).ok()?;
+    if bytes.len() as u64 > ICON_MAX_BYTES {
+        return None;
+    }
+    Some(format!("data:{mime};base64,{}", base64_encode(&bytes)))
+}
+
+/// 标准 base64 编码（与 `install::decode_base64` 对称；刻意不引依赖）。
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = u32::from(chunk[0]);
+        let b1 = u32::from(chunk.get(1).copied().unwrap_or(0));
+        let b2 = u32::from(chunk.get(2).copied().unwrap_or(0));
+        out.push(ALPHABET[(b0 >> 2) as usize] as char);
+        out.push(ALPHABET[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(b2 & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 /// 合并设置快照：manifest 默认值 + 用户已保存值（只保留 schema 声明的 key）。
@@ -813,6 +1460,12 @@ fn abort_thread(tx: SyncSender<PluginJob>, join: JoinHandle<()>) {
 ///
 /// **必须在调用方不持有任何锁时调用**（join 最长等 `SHUTDOWN_TIMEOUT`）。
 fn shutdown_one(plugin: LoadedPlugin) {
+    // beta10：先请求取消该插件正在进行的批量任务（下一次轮询即收敛并清理内部 gid），
+    // 再投递 Shutdown —— 否则插件线程阻塞在 `addTasksAndWait` 时收不到关闭信号。
+    super::tasks::cancel(&plugin.id);
+    super::plugin_tasks::cancel_all_for_plugin(&plugin.id);
+    // beta11 · B4：关闭插件同样强杀其子进程（FFmpeg 不该比插件活得更久）。
+    super::exec::kill_plugin(&plugin.id);
     // 关键路径：Shutdown 投递失败意味着插件线程不会收到显式关闭信号 → onShutdown 钩子不执行。
     // 记 warn（区别于 abort_thread 的 debug：这里是正常关闭路径，异常必须可见）。
     if plugin.tx.try_send(PluginJob::Shutdown).is_err() {
@@ -905,6 +1558,61 @@ fn plugin_thread(
                     host_reply.intercept_complete();
                 }
             }
+            PluginJob::TaskHook {
+                hook,
+                payload,
+                budget_ms,
+            } => {
+                if let Some(rt) = runtime.as_mut() {
+                    match rt.invoke_with_budget(&hook, &payload, budget_ms) {
+                        Ok(_) => failures.store(0, Ordering::Relaxed),
+                        Err(e) => {
+                            eprintln!("{e}");
+                            if let Some(n) = note_failure(&failures, &breaker, BREAKER_THRESHOLD) {
+                                enabled.store(false, Ordering::Relaxed);
+                                super::audit::log_circuit_breaker(&id, n);
+                                host_reply.host.emit(
+                                    "plugin://circuit-breaker",
+                                    json!({ "pluginId": id, "consecutiveFailures": n }),
+                                );
+                                eprintln!(
+                                    "[plugin:{id}] 连续 {n} 次 hook 异常，已自动禁用（熔断，挂起）"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            PluginJob::Detect {
+                hook,
+                payload,
+                budget_ms,
+                reply,
+            } => {
+                let result = match runtime.as_mut() {
+                    Some(rt) => rt
+                        .invoke_with_budget(&hook, &payload, budget_ms)
+                        .map_err(|e| e.to_string()),
+                    None => Err("插件运行时不可用".to_string()),
+                };
+                match &result {
+                    Ok(_) => failures.store(0, Ordering::Relaxed),
+                    Err(e) => {
+                        eprintln!("{e}");
+                        if let Some(n) = note_failure(&failures, &breaker, BREAKER_THRESHOLD) {
+                            enabled.store(false, Ordering::Relaxed);
+                            super::audit::log_circuit_breaker(&id, n);
+                            host_reply.host.emit(
+                                "plugin://circuit-breaker",
+                                json!({ "pluginId": id, "consecutiveFailures": n }),
+                            );
+                        }
+                    }
+                }
+                if reply.send(result).is_err() {
+                    tracing::debug!("任务认领回执未送达（宿主已超时）：plugin={id}");
+                }
+            }
             PluginJob::Shutdown => {
                 if let Some(rt) = runtime.as_mut() {
                     rt.shutdown();
@@ -991,7 +1699,8 @@ fn collect_changed_dirs(event: &notify::Event, out: &mut HashSet<String>) {
 /// 把 `PLUGIN_DIR/<name>/...` 还原为 `<name>`。
 ///
 /// 关键过滤：`registry.json` 与 `*.tmp`（热重载自身会原子写 registry.json，
-/// 若不过滤将触发"监听 → 重载 → 再写"的自触发循环）。
+/// 若不过滤将触发"监听 → 重载 → 再写"的自触发循环）；beta11 起 `configs`
+/// 与点目录也不是插件（配置写入 / 安装临时目录绝不能触发重载）。
 fn plugin_dir_name(path: &Path) -> Option<String> {
     let root = super::plugin_root();
     let rel = path.strip_prefix(&root).ok()?;
@@ -1000,7 +1709,7 @@ fn plugin_dir_name(path: &Path) -> Option<String> {
         std::path::Component::Normal(seg) => seg.to_string_lossy().into_owned(),
         _ => return None,
     };
-    if first == "registry.json" || first.ends_with(".tmp") || first.starts_with('.') {
+    if first == "registry.json" || first.ends_with(".tmp") || is_non_plugin_dir_name(&first) {
         return None;
     }
     if comps.next().is_some() {
@@ -1088,5 +1797,12 @@ mod tests {
         // 自触发源：registry.json / *.tmp 一律忽略（否则死循环）
         assert_eq!(plugin_dir_name(&root.join("registry.json")), None);
         assert_eq!(plugin_dir_name(&root.join("registry.json.tmp")), None);
+        // beta11 · C5：配置目录与点目录不是插件，绝不能触发重载
+        assert_eq!(plugin_dir_name(&root.join("configs")), None);
+        assert_eq!(
+            plugin_dir_name(&root.join("configs").join("com.example.hello.json")),
+            None
+        );
+        assert_eq!(plugin_dir_name(&root.join(".install-tmp")), None);
     }
 }

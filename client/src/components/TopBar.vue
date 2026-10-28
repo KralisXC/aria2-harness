@@ -1,8 +1,10 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, ref } from "vue";
 import { storeToRefs } from "pinia";
-import { invoke } from "../ipc";
+import { useNotification } from "naive-ui";
+import { errText, invoke } from "../ipc";
 import { useDownloadsStore } from "../stores/downloads";
+import { useNotificationsStore } from "../stores/notifications";
 import { useSystemStore } from "../stores/system";
 import AppIcon from "./AppIcon.vue";
 
@@ -17,6 +19,8 @@ const downloads = useDownloadsStore();
 const { list, connection } = storeToRefs(downloads);
 const system = useSystemStore();
 const { globalStat } = storeToRefs(system);
+const notifications = useNotification();
+const notices = useNotificationsStore();
 
 const tip = computed(() => (props.collapsed ? "展开侧栏" : "折叠侧栏"));
 
@@ -37,6 +41,58 @@ const statusText = computed(() => {
 
 /** NAT 状态由引擎连通性推导：引擎在跑才谈得上 NAT 映射。 */
 const natReady = computed(() => connection.value === "connected");
+
+/**
+ * beta9：服务被强杀后的一键恢复。
+ *
+ * 宿主 `restart_service` 会重新握手并（Release 下）尝试拉起 aria2-service.exe；
+ * beta9.1 起宿主只有在真实 `aria2.getVersion` 探针通过后才返回成功。前端不得
+ * 提前转绿或隐藏按钮：轮询同样走宿主的探针接口，直到确认可用才收工。
+ * 失败（UAC 拒绝 / 安全软件拦截 / 拉起超时）必须弹窗并保留按钮。
+ */
+const reconnecting = ref(false);
+
+const RESTART_FAILED_TEXT =
+  "无法重新拉起后台服务，请尝试以管理员身份重启软件或检查安全软件拦截。";
+
+/** 失败提示：系统级弹窗 + 通知中心留档（禁用提前消失）。 */
+function reportRestartFailure(detail: string) {
+  notifications.error({
+    title: "重新连接失败",
+    content: detail,
+    duration: 0,
+    closable: true,
+    keepAliveOnHover: true,
+  });
+  notices.push("error", "重新连接失败", detail, {
+    dedupeKey: "restart-service-failed",
+  });
+}
+
+async function restartService() {
+  if (reconnecting.value) return;
+  reconnecting.value = true;
+  try {
+    await invoke("restart_service");
+    // 宿主已通过探针确认就绪；这里用同一探针复核，避免事件到达前 UI 提前转绿。
+    for (let i = 0; i < 24; i += 1) {
+      const online = await invoke<boolean>("get_engine_status").catch(() => false);
+      if (online) {
+        connection.value = "connected";
+        await downloads.refreshNow().catch(() => undefined);
+        downloads.startPolling();
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    reportRestartFailure(RESTART_FAILED_TEXT);
+  } catch (err) {
+    // 宿主已给出明确原因时原样展示（含"请以管理员身份重启/检查安全软件"指引）。
+    reportRestartFailure(errText(err) || RESTART_FAILED_TEXT);
+  } finally {
+    reconnecting.value = false;
+  }
+}
 
 /** 悬浮详情：NAT / 引擎 / 端口合并展示，避免顶栏堆两个状态块。 */
 const statusDetail = computed(() => {
@@ -145,6 +201,17 @@ function fadeAndClose() {
           <span class="dot" :class="connection"></span>
           <span class="pill-text">{{ statusText }}</span>
         </span>
+        <!-- beta9：IPC / WS 断开时提供主动恢复入口（服务被强杀后 UI 不再干瞪眼）。 -->
+        <button
+          v-if="connection === 'disconnected'"
+          class="reconnect-btn no-drag"
+          :disabled="reconnecting"
+          title="重新拉起后台服务并建立连接"
+          @mousedown.stop
+          @click.stop="restartService"
+        >
+          {{ reconnecting ? "重连中…" : "重新连接" }}
+        </button>
       </div>
     </div>
 
@@ -307,6 +374,29 @@ function fadeAndClose() {
 
 .pill.status {
   color: var(--text-2);
+}
+
+/* beta9：断线重连 —— 红色描边胶囊，与常规状态块同高。 */
+.reconnect-btn {
+  flex: none;
+  height: 24px;
+  padding: 0 12px;
+  border: 1px solid var(--danger);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--danger);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+.reconnect-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
+}
+.reconnect-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
 }
 
 .dot {

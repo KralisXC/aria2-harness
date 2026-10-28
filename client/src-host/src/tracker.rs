@@ -17,7 +17,6 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::{Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::rpc_client::Client;
@@ -65,28 +64,13 @@ fn unix_now() -> u64 {
 // ---------------------------------------------------------------------------
 // 内部任务 gid 隔离
 // ---------------------------------------------------------------------------
+//
+// beta10：注册表已下沉到 `crate::internal_gids`（插件分片任务也要复用）。
+// 这里保留同名 re-export，既有调用点（lib.rs / dispatcher.rs / 单测）零改动。
 
-/// 内部任务（当前只有 tracker 自拉）的 gid 集合。
-/// 进程级 `OnceLock<Mutex<..>>`：gid 在运行期产生，需要可变容器。
-static INTERNAL_GIDS: OnceLock<StdMutex<HashSet<String>>> = OnceLock::new();
+pub use crate::internal_gids::is_internal;
 
-fn internal_gids() -> &'static StdMutex<HashSet<String>> {
-    INTERNAL_GIDS.get_or_init(|| StdMutex::new(HashSet::new()))
-}
-
-/// 该 gid 是否为内部任务（UI / 历史库 / 通知都据此过滤）。
-pub fn is_internal(gid: &str) -> bool {
-    internal_gids()
-        .lock()
-        .map(|set| set.contains(gid))
-        .unwrap_or(false)
-}
-
-fn mark_internal(gid: &str) {
-    if let Ok(mut set) = internal_gids().lock() {
-        set.insert(gid.to_string());
-    }
-}
+use crate::internal_gids::mark_internal;
 
 // ---------------------------------------------------------------------------
 // 调度

@@ -30,14 +30,18 @@ aria2.session
 
 # ---- 打包产物 ----
 installer_output/
+build/
 Aria2-Harness-v*/
 *.exe
 *.msi
+*.zip
+packages/
 
 # ---- aria2 C++ 构建残留 ----
 aria2-1.37.0/Makefile
 aria2-1.37.0/config.status
 aria2-1.37.0/config.log
+aria2-1.37.0/config.h
 aria2-1.37.0/autom4te.cache/
 aria2-1.37.0/**/*.o
 aria2-1.37.0/**/*.lo
@@ -45,6 +49,14 @@ aria2-1.37.0/**/*.a
 aria2-1.37.0/**/*.la
 aria2-1.37.0/**/.libs/
 aria2-1.37.0/**/.deps/
+aria2-1.37.0/libtool
+aria2-1.37.0/**/libtool
+aria2-1.37.0/stamp-h1
+aria2-1.37.0/**/stamp-h1
+aria2-1.37.0/build_make.log
+
+# ---- WebView2 固定运行时（约 674 MB，安装 Full 版时按需下载，不入库）----
+client/src-host/assets/WebView2Runtime/
 
 # ---- 编辑器 / 系统 ----
 .vscode/*

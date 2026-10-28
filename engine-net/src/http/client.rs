@@ -16,7 +16,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use http::header::{ACCEPT, HOST, RANGE, REFERER, USER_AGENT};
+use http::header::{ACCEPT, COOKIE, HOST, RANGE, REFERER, USER_AGENT};
 use http::{HeaderName, HeaderValue, Request, StatusCode, Uri};
 use http_body_util::{BodyExt, Empty};
 use hyper::body::Bytes;
@@ -26,7 +26,9 @@ use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use crate::dns::resolver::{DnsResolver, default_port};
 use crate::error::NetworkError;
 use crate::http::proxy::ProxySettings;
-use crate::http::session::{ByteRange, HttpSession};
+use crate::http::session::{
+    ByteRange, HttpSession, allows_html_download, is_html_body,
+};
 use crate::http::tls::TlsOptions;
 
 /// 单次下载的可选项（对齐 aria2 同名参数）。
@@ -169,6 +171,16 @@ where
     let session = HttpSession::new(req.options.clone(), resolver.clone())?;
     let range = (req.resume_from > 0).then(|| ByteRange::new(req.resume_from, None));
     let response = session.get_range(&req.url, range).await?;
+
+    // beta9：防爬站点会把深层重定向落到登录/验证页（200 + text/html）。
+    // 在写盘前终止，避免留下一个打不开的假文件。
+    // 只判断成功响应：403/429 的错误页同样是 text/html，必须留给限流降级处理。
+    if matches!(response.status.as_u16(), 200 | 206)
+        && is_html_body(response.content_type.as_deref())
+        && !allows_html_download(&req.dest, response.content_disposition.as_deref())
+    {
+        return Err(NetworkError::HtmlInsteadOfFile);
+    }
 
     let (offset, total_length, range_used) =
         validate_response(response.status, response.total_length, response.content_range, req.resume_from)?;
@@ -348,7 +360,10 @@ fn path_and_query(uri: &Uri) -> String {
 /// 组装请求。
 ///
 /// - `absolute=true`：HTTP 代理 forward 模式，request-target 用完整 URI；
-/// - `h2=true`：HTTP/2 用完整 URI 让 hyper 生成 `:scheme/:authority`，不发 Host 头。
+/// - `h2=true`：HTTP/2 用完整 URI 让 hyper 生成 `:scheme/:authority`，不发 Host 头；
+/// - `extra_cookie`：跳转链 Cookie 罐的完整 `Cookie` 值（已含 `options.headers`
+///   里的初始 Cookie 与本链吸收的 `Set-Cookie`）。给了它就跳过 `options.headers`
+///   里的 `cookie`，避免同名头重复下发。
 pub(crate) fn build_request(
     uri: &Uri,
     options: &HttpOptions,
@@ -356,6 +371,7 @@ pub(crate) fn build_request(
     absolute: bool,
     h2: bool,
     proxy_authorization: Option<&str>,
+    extra_cookie: Option<&str>,
 ) -> Result<Request<Empty<Bytes>>, NetworkError> {
     let target = if absolute || h2 {
         uri.to_string()
@@ -383,7 +399,16 @@ pub(crate) fn build_request(
                 .map_err(|err| NetworkError::HttpProtocol(format!("代理认证头非法：{err}")))?,
         );
     }
+    if let Some(cookie) = extra_cookie {
+        let value = HeaderValue::from_str(cookie)
+            .map_err(|err| NetworkError::HttpProtocol(format!("Cookie 头非法：{err}")))?;
+        builder = builder.header(COOKIE, value);
+    }
     for (name, value) in &options.headers {
+        if extra_cookie.is_some() && name.eq_ignore_ascii_case("cookie") {
+            // 已由 extra_cookie 统一合并（含跳转链吸收的 Set-Cookie）。
+            continue;
+        }
         let name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|err| NetworkError::HttpProtocol(format!("非法请求头名 `{name}`：{err}")))?;
         let value = HeaderValue::from_str(value)
@@ -436,11 +461,11 @@ mod tests {
     fn h2_only_request_target_is_absolute() {
         let uri: Uri = "https://example.com/a?b=1".parse().unwrap();
         let options = HttpOptions::default();
-        let request = build_request(&uri, &options, None, false, true, None).unwrap();
+        let request = build_request(&uri, &options, None, false, true, None, None).unwrap();
         assert_eq!(request.uri().to_string(), "https://example.com/a?b=1");
         assert!(request.headers().get(HOST).is_none());
 
-        let request = build_request(&uri, &options, None, false, false, None).unwrap();
+        let request = build_request(&uri, &options, None, false, false, None, None).unwrap();
         assert_eq!(request.uri().to_string(), "/a?b=1");
         assert_eq!(request.headers().get(HOST).unwrap(), "example.com");
     }
@@ -456,6 +481,7 @@ mod tests {
             false,
             false,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(request.headers().get(RANGE).unwrap(), "bytes=5-9");
@@ -467,9 +493,28 @@ mod tests {
             false,
             false,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(request.headers().get(RANGE).unwrap(), "bytes=5-");
+    }
+
+    #[test]
+    fn extra_cookie_replaces_header_cookie_without_duplicating() {
+        let uri: Uri = "http://a.test/f".parse().unwrap();
+        let mut options = HttpOptions::default();
+        options.headers = vec![("Cookie".to_string(), "a=1".to_string())];
+
+        // 给了 extra_cookie：只下发合并后的罐值，不再重复 options 里的 Cookie。
+        let request = build_request(&uri, &options, None, false, false, None, Some("a=1; s=2"))
+            .unwrap();
+        let cookies: Vec<_> = request.headers().get_all(COOKIE).iter().collect();
+        assert_eq!(cookies.len(), 1);
+        assert_eq!(cookies[0], "a=1; s=2");
+
+        // 没给：沿用 options.headers 里的原始 Cookie。
+        let request = build_request(&uri, &options, None, false, false, None, None).unwrap();
+        assert_eq!(request.headers().get(COOKIE).unwrap(), "a=1");
     }
 
     #[test]

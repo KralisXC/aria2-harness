@@ -328,13 +328,22 @@ pub async fn establish(
     timeout: Duration,
     proxy_tls: &TlsOptions,
 ) -> Result<EstablishedProxy, NetworkError> {
+    // beta9：代理自身的 TCP 建连失败统一归为 `ProxyConnectionFailed` ——
+    // 代理软件被关闭时这里通常拿到 ConnectionRefused / Timeout，若不包裹就会
+    // 冒泡成普通网络错误，任务直接判死；包裹后 registry 可降级为「暂停」。
     let connected = crate::dns::connect::connect(
         &proxy.host,
         proxy.port,
         resolver,
         timeout,
     )
-    .await?;
+    .await
+    .map_err(|err| {
+        NetworkError::ProxyConnectionFailed(format!(
+            "无法连接代理 {}:{}（{err}）",
+            proxy.host, proxy.port
+        ))
+    })?;
     let proxy_ip = connected.ip;
 
     let mut stream: BoxStream = match proxy.kind {

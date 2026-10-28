@@ -3,10 +3,10 @@
 ;  编译（双版本）：
 ;    Full（内置 WebView2 运行时，约 230MB）：ISCC.exe setup.iss
 ;    Lite（不含 WebView2Runtime，约 15MB）： ISCC.exe /DLITE setup.iss
-;  产物：installer_output\Aria2-Harness-Setup-1.0.0-beta8-x64-Full.exe
-;        installer_output\Aria2-Harness-Setup-1.0.0-beta8-x64-Lite.exe
+;  产物：installer_output\Aria2-Harness-Setup-1.0.0-rc1-x64-Full.exe
+;        installer_output\Aria2-Harness-Setup-1.0.0-rc1-x64-Lite.exe
 ;
-;  beta8 覆盖安装数据安全（Full 与 Lite 任意互切）：
+;  beta8 ~ beta8.2 覆盖安装数据安全（Full 与 Lite 任意互切）：
 ;    覆盖安装只替换程序本体（exe / dll / dist / browser-extension / WebView2Runtime），
 ;    绝不触碰 data\（任务列表 / session / SQLite）、plugins\、downloads\、config.json 与
 ;    %LOCALAPPDATA%\Aria2-Harness（安装版的用户数据根）。
@@ -19,15 +19,18 @@
 ; ============================================================================
 
 #define MyAppName        "Aria2-Harness"
-#define MyAppVersion     "1.0.0-beta8"
+#define MyAppVersion     "1.0.0-rc1"
 #define MyAppPublisher   "lingxi"
 #define MyAppExeName     "aria2-harness.exe"
-#define MyPkgDir         "Aria2-Harness-v1.0.0-beta8-Windows-x64"
 ; 版本分支：/DLITE 编译轻量版，其余一律完整版。
+; beta12.4：便携包按 Full / Lite 分目录组装，源目录随之切换。
+; 1.0.0-rc1：源目录切到 build\rc1（结构不变）。
 #ifdef LITE
   #define MyEdition "Lite"
+  #define MyPkgDir  "build\rc1\Aria2-Harness-v1.0.0-rc1-Windows-x64\Lite"
 #else
   #define MyEdition "Full"
+  #define MyPkgDir  "build\rc1\Aria2-Harness-v1.0.0-rc1-Windows-x64\Full"
 #endif
 ; 固定 AppId：升级安装靠它识别同一产品，**发布后不可再改**。
 ; 装 v1.0-beta6 时 Inno 看到同一个 AppId 会走「覆盖安装」，不会出现"两个 Aria2-Harness"。
@@ -104,6 +107,26 @@ Source: "{#MyPkgDir}\WebView2Loader.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#MyPkgDir}\dist\*"; DestDir: "{app}\dist"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; —— 浏览器扩展（设置 → 网络「安装浏览器扩展」引导用户加载此目录）——
 Source: "{#MyPkgDir}\browser-extension\*"; DestDir: "{app}\browser-extension"; Flags: ignoreversion recursesubdirs createallsubdirs
+; —— beta12.3：Full 版内置 FFmpeg 业务插件 + 共享组件包 ——
+; 宿主扫描的是「数据根/data/plugins」而非安装目录：安装到 Program Files 时数据根在
+; %LOCALAPPDATA%\Aria2-Harness，便携布局则跟随 {app}（见 src/paths.rs 的 detect_home）。
+; Lite 版不包含任何插件与共享池：用户按 README 下载对应 .zip 解压到同一目录即可。
+;
+; 注意：本段 Source 是**唯一**不取 {#MyPkgDir} 的条目，按脚本所在目录（仓库根）解析。
+; 插件源文件只有一份（data\plugins\），构建时无需再往便携包目录里复制，
+; 避免"仓库 / 便携包"两份插件各自漂移。
+;
+; 插件本体只含 manifest.json / main.js（体积 < 20KB），ffmpeg.exe 与 MinGW 运行库
+; 平铺在 data\plugins\.shared\com.harness.shared-ffmpeg（与 manifest.json 同级，beta12.3 去 bin），
+; 宿主 exec::resolve_program 按「插件 bin → .shared/<共享id>/ → .shared/<共享id>/bin → 系统 PATH」顺序查找。
+; 点目录不会被插件扫描器当成插件（manager 跳过 `.` 开头的目录）。
+#ifndef LITE
+Source: "data\plugins\.shared\com.harness.shared-ffmpeg\*"; DestDir: "{code:PluginDataDir}\.shared\com.harness.shared-ffmpeg"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "data\plugins\hls-downloader\*"; DestDir: "{code:PluginDataDir}\hls-downloader"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "data\plugins\m4s-merger\*";    DestDir: "{code:PluginDataDir}\m4s-merger";    Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "data\plugins\live-recorder\*"; DestDir: "{code:PluginDataDir}\live-recorder"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "data\plugins\media-converter\*"; DestDir: "{code:PluginDataDir}\media-converter"; Flags: ignoreversion recursesubdirs createallsubdirs
+#endif
 ; —— WebView2 Fixed Version 运行时（仅 Full 版内置）——
 ; 精简版 Win11 常把 Evergreen 运行时裁掉，导致 wry 建不出控制器、双击毫无反应。
 ; 随包内置固定版本后，宿主通过 WEBVIEW2_BROWSER_EXECUTABLE_FOLDER 指向本目录，
@@ -138,16 +161,15 @@ Type: filesandordirs; Name: "{app}\WebView2Runtime"
 #endif
 
 [Dirs]
-; 安装目录下的 data / plugins / downloads 只是占位与保护：
-; Program Files 对普通用户只读，实际可写目录由宿主自动落到
-; %LOCALAPPDATA%\Aria2-Harness（见 src/paths.rs）。
+; 安装目录下的 data 只是占位与保护：Program Files 对普通用户只读，实际可写目录
+; 由宿主自动落到 %LOCALAPPDATA%\Aria2-Harness（见 src/paths.rs）。
 ; **uninsneveruninstall 是 beta8 的数据红线**：即使 [UninstallDelete] 或未来某次
 ; 改动误删，这些目录也不会在卸载 / 覆盖安装时被移除。
-; downloads 仅用于「装到非系统盘（便携布局）」时保护历史下载目录，默认下载夹
-; 仍是系统「下载」文件夹。
+;
+; beta10.1：绝不在此创建 plugins / downloads —— 插件与下载数据的真实位置统一是
+; 「数据根/data/plugins」「数据根/data/downloads」。旧版曾在此留下两个空目录，
+; 用户看到安装目录里凭空多出两个空文件夹，纯属误导。
 Name: "{app}\data";      Flags: uninsneveruninstall
-Name: "{app}\plugins";   Flags: uninsneveruninstall
-Name: "{app}\downloads"; Flags: uninsneveruninstall
 ; 安装版的用户数据根（config.json / data / WebView2 存储所在）：
 ; 同样禁止卸载器自动删除，只有用户在卸载弹窗里明确选「是」才由 [Code] 清理。
 Name: "{localappdata}\Aria2-Harness"; Flags: uninsneveruninstall
@@ -210,6 +232,27 @@ const
     即 Setup 段写入的 AppVersion。admin 安装落在 HKLM，这里 HKLM64/HKLM32/HKCU
     三处都查，避免 32 位视图或历史用户级安装漏判。 }
   UninstallKey = 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{B7C4F2A1-3D6E-4F8B-9C2A-5E7D1A0B3C48}_is1';
+
+{ 安装是否落在系统目录（Program Files）：决定宿主数据根的位置。 }
+function IsSystemInstall(): Boolean;
+var
+  AppDir, PfDir: String;
+begin
+  AppDir := Lowercase(ExpandConstant('{app}'));
+  PfDir := Lowercase(ExpandConstant('{autopf}'));
+  Result := Pos(PfDir, AppDir) = 1;
+end;
+
+{ beta10：Full 版内置插件的目标目录 —— 必须与宿主 `paths::plugins_dir()` 一致。
+  Program Files 安装 → %LOCALAPPDATA%\Aria2-Harness\data\plugins；
+  非系统盘（便携布局）→ 安装目录\data\plugins。 }
+function PluginDataDir(Param: String): String;
+begin
+  if IsSystemInstall() then
+    Result := ExpandConstant('{localappdata}\Aria2-Harness\data\plugins')
+  else
+    Result := ExpandConstant('{app}\data\plugins');
+end;
 
 function UserDataDir(): String;
 begin

@@ -69,6 +69,13 @@ pub enum AppError {
     #[error("请求参数非法：{0}")]
     InvalidArgs(String),
 
+    /// 安装包含 `exec:local` 的插件前，必须由用户显式信任（rc1 · 模块一）。
+    ///
+    /// 这是**可恢复**的安全闸门：前端据此弹红色确认框，用户同意后带
+    /// `allowExecLocal=true` 重试同一安装包；拒绝则安装中止（staging 已清理）。
+    #[error("此插件包含外部可执行文件，是否信任并安装？{0}")]
+    ConsentRequired(String),
+
     /// 序列化 / 反序列化失败。
     #[error("数据序列化失败：{0}")]
     Serde(#[from] serde_json::Error),
@@ -110,6 +117,7 @@ impl AppError {
             Self::Network(_) => "NETWORK",
             Self::Service(_) => "SERVICE_UNAVAILABLE",
             Self::InvalidArgs(_) => "INVALID_ARGS",
+            Self::ConsentRequired(_) => "PLUGIN_CONSENT_REQUIRED",
             Self::Serde(_) => "SERDE",
             Self::Internal(_) => "INTERNAL",
             Self::Db { .. } => "DB",

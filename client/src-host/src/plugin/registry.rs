@@ -106,6 +106,10 @@ impl Registry {
     }
 
     /// 覆盖写入某插件的设置快照（不存在记录时补建，保持启用态）。
+    ///
+    /// beta11（C4）起运行时设置以 `data/plugins/configs/<id>.json` 为准，
+    /// 本方法仅保留给旧 `registry.json` 记录的兼容/迁移路径，暂无调用方。
+    #[allow(dead_code)]
     pub fn set_settings(&mut self, id: &str, settings: HashMap<String, Value>) {
         match self.plugins.iter_mut().find(|r| r.id == id) {
             Some(rec) => rec.settings = settings,
@@ -135,6 +139,11 @@ impl Registry {
     pub fn insert(&mut self, id: &str, enabled: bool, permissions: &[String]) {
         self.grant(id, permissions);
         self.set_enabled(id, enabled);
+    }
+
+    /// 删除某插件的整条记录（beta11 · B13：卸载时清理授权账本）。
+    pub fn remove(&mut self, id: &str) {
+        self.plugins.retain(|record| record.id != id);
     }
 
     /// 写回磁盘：先写 `.tmp` 再原子替换，避免半写损坏。

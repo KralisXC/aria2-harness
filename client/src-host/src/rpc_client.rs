@@ -43,6 +43,14 @@ const RECONNECT_MAX: Duration = Duration::from_secs(30);
 /// 待发请求队列容量。有界：队列满说明在途请求异常堆积，宁可显式报错也不无限吃内存。
 const OUT_QUEUE_CAP: usize = 256;
 
+/// beta9.1：心跳发送间隔（WebSocket Ping）。
+const HEARTBEAT_TICK: Duration = Duration::from_secs(5);
+/// beta9.1：连续无任何入站帧的上界。超过即判定连接假死并强制断开重连。
+///
+/// 背景：aria2-service.exe 被强杀后，Windows 有时不会立刻给对端送 RST，
+/// 只靠读错误会让 UI 长期停在「已连接」；必须由心跳兜底。
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// 通知广播容量。订阅者落后时会被丢弃并报 `Lagged`，由订阅方决定如何记账。
 const NOTIFY_CAP: usize = 256;
 
@@ -108,6 +116,8 @@ struct Inner {
     closing: AtomicBool,
     /// 重连唤醒：窗口重新获得焦点时打断退避，立即重试（见 [`Client::reconnect_now`]）。
     wake: tokio::sync::Notify,
+    /// beta9.1：主动踢掉当前连接（健康检查失败时），让守护任务立即重连。
+    kick: tokio::sync::Notify,
 }
 
 /// 共享句柄（`Arc` 内部，clone 廉价）。
@@ -136,6 +146,7 @@ impl Client {
                 connected: AtomicBool::new(false),
                 closing: AtomicBool::new(false),
                 wake: tokio::sync::Notify::new(),
+                kick: tokio::sync::Notify::new(),
             }),
         };
         let inner = client.inner.clone();
@@ -163,6 +174,13 @@ impl Client {
     /// 由「窗口重新获得焦点」触发 —— 后台期间引擎可能已恢复，没必要再等最长 30s。
     pub fn reconnect_now(&self) {
         self.inner.wake.notify_one();
+    }
+
+    /// beta9.1：强制踢掉当前会话（健康检查失败 / 引擎无响应时）。
+    ///
+    /// 守护任务收到通知后跳出读循环，走标准的「标记断开 → 通知前端 → 退避重连」路径。
+    pub fn force_disconnect(&self) {
+        self.inner.kick.notify_waiters();
     }
 
     /// 更新 `rpc-secret`（引擎重启后由核心服务重新下发）。
@@ -497,38 +515,70 @@ async fn session(
 ) {
     let (mut sink, mut stream) = ws.split();
 
+    // beta9.1：心跳。任何入站帧（回执 / 通知 / Ping / Pong）都算"活着"；
+    // 超过 HEARTBEAT_TIMEOUT 完全没有入站帧即判定假死，主动断开让守护任务重连。
+    let mut heartbeat = tokio::time::interval(HEARTBEAT_TICK);
+    heartbeat.tick().await; // 消费首次立即到期的 tick，避免刚连上就误判。
+    let mut last_inbound = tokio::time::Instant::now();
+
     loop {
         tokio::select! {
             // `biased`：优先读，保证关闭帧/回执不会被写队列长期饿死。
             biased;
 
+            // 健康检查失败 / 引擎无响应：上层可直接踢掉会话。
+            _ = inner.kick.notified() => {
+                tracing::warn!("aria2 RPC 收到强制断开指令，结束当前会话");
+                break;
+            }
+
             incoming = stream.next() => {
                 match incoming {
-                    Some(Ok(Message::Text(text))) => handle_text(inner, text.as_str()),
-                    Some(Ok(Message::Binary(bytes))) => {
-                        // aria2 只发文本帧；二进制帧按 UTF-8 容错处理，不静默丢弃。
-                        match std::str::from_utf8(&bytes) {
-                            Ok(text) => handle_text(inner, text),
-                            Err(_) => tracing::warn!("aria2 RPC 收到非法二进制帧（非 UTF-8）"),
+                    Some(Ok(message)) => {
+                        last_inbound = tokio::time::Instant::now();
+                        match message {
+                            Message::Text(text) => handle_text(inner, text.as_str()),
+                            Message::Binary(bytes) => {
+                                // aria2 只发文本帧；二进制帧按 UTF-8 容错处理，不静默丢弃。
+                                match std::str::from_utf8(&bytes) {
+                                    Ok(text) => handle_text(inner, text),
+                                    Err(_) => tracing::warn!("aria2 RPC 收到非法二进制帧（非 UTF-8）"),
+                                }
+                            }
+                            Message::Ping(payload) => {
+                                if let Err(err) = sink.send(Message::Pong(payload)).await {
+                                    tracing::warn!("aria2 RPC 回 Pong 失败：{err}");
+                                    break;
+                                }
+                            }
+                            Message::Close(frame) => {
+                                tracing::info!("aria2 RPC 收到关闭帧：{frame:?}");
+                                break;
+                            }
+                            // Pong / Frame 等无需处理（Pong 已在上面刷新 last_inbound）。
+                            _ => {}
                         }
                     }
-                    Some(Ok(Message::Ping(payload))) => {
-                        if let Err(err) = sink.send(Message::Pong(payload)).await {
-                            tracing::warn!("aria2 RPC 回 Pong 失败：{err}");
-                            break;
-                        }
-                    }
-                    Some(Ok(Message::Close(frame))) => {
-                        tracing::info!("aria2 RPC 收到关闭帧：{frame:?}");
-                        break;
-                    }
-                    // Pong / Frame 等无需处理。
-                    Some(Ok(_)) => {}
                     Some(Err(err)) => {
                         tracing::warn!("aria2 RPC 读取出错：{err}");
                         break;
                     }
                     None => break,
+                }
+            }
+
+            _ = heartbeat.tick() => {
+                if last_inbound.elapsed() >= HEARTBEAT_TIMEOUT {
+                    tracing::warn!(
+                        "aria2 RPC 心跳超时（{}s 无入站帧），强制断开",
+                        HEARTBEAT_TIMEOUT.as_secs()
+                    );
+                    break;
+                }
+                // 主动 Ping：对端若已消失但 TCP 未报错，Pong 缺失会让上面的超时兜底生效。
+                if let Err(err) = sink.send(Message::Ping(Vec::new().into())).await {
+                    tracing::warn!("aria2 RPC 心跳发送失败：{err}");
+                    break;
                 }
             }
 
@@ -687,6 +737,7 @@ mod tests {
             connected: AtomicBool::new(true),
             closing: AtomicBool::new(false),
             wake: tokio::sync::Notify::new(),
+            kick: tokio::sync::Notify::new(),
         };
 
         let (tx1, mut rx1) = oneshot::channel();
@@ -733,6 +784,7 @@ mod tests {
                 connected: AtomicBool::new(false),
                 closing: AtomicBool::new(false),
                 wake: tokio::sync::Notify::new(),
+                kick: tokio::sync::Notify::new(),
             }),
         };
 

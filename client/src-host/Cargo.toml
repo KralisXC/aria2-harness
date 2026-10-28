@@ -1,6 +1,6 @@
-﻿[package]
+[package]
 name = "aria2-harness"
-version = "1.0.0-beta8"
+version = "1.0.0-rc1"
 description = "Aria2-Harness —— 模块化自进化下载器（aria2 引擎 + Rust 宿主 + WebView UI）"
 authors = ["lingxi"]
 edition = "2024"
@@ -92,6 +92,10 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # M1 全同步执行，因此只启用 std（不启 futures/loader/macro）；ES module 由
 # 预注入的 harness 全局门面代替（见 src/plugin/quickjs.rs）
 rquickjs = { version = "0.14", default-features = false, features = ["std"] }
+# beta10.1：插件拖拽安装（.zip 解压）。
+# 只保留 deflate 解压（flate2 → miniz_oxide 纯 Rust 后端），不引加密 / bzip2 / zstd，
+# 避免为安装功能拉入额外的原生依赖。
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 # 插件完整性校验（manifest.integrity 逐文件 SHA-256）
 sha2 = "0.11.1"
 # 可观测性底座（增量 18）：tracing 事件 + 按天轮转落盘 + RUST_LOG 级别过滤
@@ -173,7 +177,7 @@ windows = { version = "0.62", features = [
 # （仅有 -gnu / -msvc），官方建议改用 `bindgen` 在构建期生成绑定。
 # **仅对 gnullvm 目标生效** —— MSVC 日常构建不受影响：rquickjs-sys 的 build.rs 在
 # `target == host` 时直接复用内置 bindings，根本不跑 bindgen（见其 build.rs 351-364 行）。
-# 需要 libclang：`LIBCLANG_PATH=<LLVM_ROOT>\bin`。
+# 需要 libclang：`LIBCLANG_PATH=D:\LLVM\bin`。
 [target.x86_64-pc-windows-gnullvm.dependencies]
 rquickjs = { version = "0.14", default-features = false, features = ["std", "bindgen"] }
 

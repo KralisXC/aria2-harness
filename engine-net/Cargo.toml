@@ -1,6 +1,6 @@
 [package]
 name = "engine-net"
-version = "1.0.0-beta8"
+version = "1.0.0-beta10.1"
 edition = "2024"
 description = "Aria2-Harness 原生 HTTP(S) 引擎（C-3）"
 publish = false

@@ -1260,7 +1260,8 @@ async fn handle_quit_for_update(
 async fn dispatch(cmd: &str, args: Value) -> Result<Value, AppError> {
     match cmd {
         "add_download" => {
-            let url = take_str(&args, "url")?;
+            // 多 URI：前端按行拆分后一次提交，`urls` 数组透传给 `aria2.addUri`。
+            let urls = take_str_list(&args, "urls")?;
             // 前端 `dir: null` 时透传 None，由后端回退默认下载目录。
             let dir = args.get("dir").and_then(|v| v.as_str()).map(str::to_string);
             // 单任务选项（referer 等）：可选对象，缺失即视为无。
@@ -1268,7 +1269,7 @@ async fn dispatch(cmd: &str, args: Value) -> Result<Value, AppError> {
                 .get("options")
                 .and_then(|v| v.as_object().cloned())
                 .filter(|map| !map.is_empty());
-            Ok(json!(lib::add_download(url, dir, options).await?))
+            Ok(json!(lib::add_download(urls, dir, options).await?))
         }
         // 拖拽 `.torrent`：前端读字节转 base64（WebView 不暴露真实路径）。
         "add_torrent" => {
@@ -1284,8 +1285,17 @@ async fn dispatch(cmd: &str, args: Value) -> Result<Value, AppError> {
         }
         "get_active_tasks" => Ok(json!(lib::get_active_tasks().await?)),
         "get_engine_status" => Ok(json!(lib::get_engine_status().await?)),
+        // 设置 → 网络：读取当前生效的 RPC 密钥（服务端真值）。
+        "get_rpc_secret" => Ok(json!(lib::get_rpc_secret())),
+        // 设置 → 网络：热更新 RPC 密钥（不重启引擎、不中断当前下载）。
+        "set_rpc_secret" => {
+            lib::set_rpc_secret(take_str(&args, "secret")?).await?;
+            Ok(Value::Null)
+        }
         // 窗口回到前台：WS 断开时打断退避立即重连。
         "reconnect_engine" => Ok(json!(lib::reconnect_engine().await?)),
+        // beta9：顶栏「重新连接」——服务进程被强杀时重新拉起并重建 WS。
+        "restart_service" => Ok(json!(lib::restart_service().await?)),
         "change_global_option" => {
             let options = args
                 .get("options")
@@ -1373,6 +1383,42 @@ async fn dispatch(cmd: &str, args: Value) -> Result<Value, AppError> {
             Ok(Value::Null)
         }
         "list_plugins" => Ok(json!(lib::list_plugins())),
+        // beta10：插件接管的虚拟任务（HLS 等）。
+        "get_plugin_tasks" => Ok(json!(lib::list_plugin_tasks())),
+        "cancel_plugin_task" => {
+            lib::cancel_plugin_task(take_str(&args, "id")?).await?;
+            Ok(Value::Null)
+        }
+        // beta10.1：移除已结束的虚拟任务（与取消区分：不再中断下载）。
+        // beta12.3：`withFiles`（camelCase，与前端约定一致）为 true 时级联清理产物与临时目录。
+        "remove_plugin_task" => {
+            let id = take_str(&args, "id")?;
+            let with_files = args
+                .get("withFiles")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            lib::remove_plugin_task(id, with_files).await?;
+            Ok(Value::Null)
+        }
+        // beta10.1：拖拽安装插件包（.zip，base64 内容）。
+        // 1.0.0-rc1：`allowExecLocal` 由前端在红色安全确认后置 true（缺省 false）。
+        "install_plugin_zip" => Ok(lib::install_plugin_zip(
+            take_str(&args, "data")?,
+            args.get("allowExecLocal").and_then(Value::as_bool).unwrap_or(false),
+        )?),
+        // beta10.1：拖拽安装插件文件夹（[{ path, data }]）。
+        "install_plugin_dir" => {
+            let files = args
+                .get("files")
+                .cloned()
+                .ok_or_else(|| {
+                    AppError::InvalidArgs("install_plugin_dir：缺少 files".to_string())
+                })?;
+            Ok(lib::install_plugin_dir(
+                files,
+                args.get("allowExecLocal").and_then(Value::as_bool).unwrap_or(false),
+            )?)
+        }
         "toggle_plugin" => {
             let id = take_str(&args, "id")?;
             let enabled = args
@@ -1395,6 +1441,39 @@ async fn dispatch(cmd: &str, args: Value) -> Result<Value, AppError> {
                     AppError::InvalidArgs("update_plugin_settings：缺少 values".to_string())
                 })?;
             lib::update_plugin_settings(id, values)?;
+            Ok(Value::Null)
+        }
+        // beta11：插件日志控制台（历史回填 + 清空）。
+        "get_plugin_logs" => {
+            let id = take_str(&args, "id")?;
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|value| value as usize)
+                .unwrap_or(500);
+            Ok(json!(lib::get_plugin_logs(id, limit)))
+        }
+        "clear_plugin_logs" => {
+            lib::clear_plugin_logs(take_str(&args, "id")?);
+            Ok(Value::Null)
+        }
+        // beta11：卸载插件（删目录 + 配置 + 授权账本）。
+        "uninstall_plugin" => {
+            lib::uninstall_plugin(take_str(&args, "id")?)?;
+            Ok(Value::Null)
+        }
+        // beta12.2：共享组件（`data/plugins/.shared/<id>`）列表与卸载。
+        "list_shared_plugins" => Ok(json!(lib::list_shared_plugins())),
+        "uninstall_shared_plugin" => {
+            lib::uninstall_shared_plugin(take_str(&args, "id")?)?;
+            Ok(Value::Null)
+        }
+        // beta11 / ff.md：已完成任务的右键插件动作（onAction hook）。
+        "run_plugin_action" => {
+            let plugin_id = take_str(&args, "pluginId")?;
+            let action_id = take_str(&args, "actionId")?;
+            let task = args.get("task").cloned().unwrap_or(Value::Null);
+            lib::run_plugin_action(plugin_id, action_id, task)?;
             Ok(Value::Null)
         }
         "get_metrics" => lib::get_metrics(),
@@ -1426,4 +1505,20 @@ fn take_str(args: &Value, key: &str) -> Result<String, AppError> {
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .ok_or_else(|| AppError::InvalidArgs(format!("缺少参数：{key}")))
+}
+
+/// 从 args 中取字符串数组参数（元素非字符串直接拒绝，避免静默丢地址）。
+fn take_str_list(args: &Value, key: &str) -> Result<Vec<String>, AppError> {
+    let items = args
+        .get(key)
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| AppError::InvalidArgs(format!("缺少参数：{key}")))?;
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let text = item
+            .as_str()
+            .ok_or_else(|| AppError::InvalidArgs(format!("参数 {key} 必须是字符串数组")))?;
+        out.push(text.to_string());
+    }
+    Ok(out)
 }

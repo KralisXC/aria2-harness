@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "Aria2-Harness",
-  "version": "1.0.2",
-  "description": "把浏览器下载交给本机的 Aria2-Harness：点击图标切换接管，角标显示 ON / OFF / ERR。",
-  "permissions": ["downloads", "cookies", "storage", "activeTab", "alarms", "notifications"],
+  "version": "1.0.9",
+  "description": "把浏览器下载交给本机的 Aria2-Harness：Popup 手动解析页面，命中站点插件时显示悬浮下载按钮。",
+  "permissions": ["downloads", "cookies", "storage", "activeTab", "alarms", "webRequest", "scripting"],
   "host_permissions": [
     "<all_urls>",
     "http://127.0.0.1/*",
@@ -13,8 +13,32 @@
     "service_worker": "background.js"
   },
   "action": {
-    "default_title": "Aria2-Harness 接管（点击切换）"
+    "default_title": "Aria2-Harness",
+    "default_popup": "popup.html"
   },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["inject-network.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": false
+    },
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["holo-main.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": false
+    },
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["holo-bridge.js"],
+      "run_at": "document_start",
+      "world": "ISOLATED",
+      "all_frames": false
+    }
+  ],
   "icons": {
     "128": "icon128.png"
   }

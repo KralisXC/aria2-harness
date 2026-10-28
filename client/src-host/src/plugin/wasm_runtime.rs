@@ -594,6 +594,11 @@ mod tests {
             )),
             host: host.clone(),
             bridge: HostBridge::for_test(tx),
+            granted: Arc::new(std::sync::RwLock::new(
+                permissions.iter().map(|s| (*s).to_string()).collect(),
+            )),
+            limits: crate::plugin::manifest::Limits::default(),
+            plugin_dir: std::path::PathBuf::from("."),
         };
         (ctx, host)
     }

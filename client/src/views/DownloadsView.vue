@@ -1,30 +1,35 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { storeToRefs } from "pinia";
 import {
   NCheckbox,
   NDropdown,
   NModal,
-  NVirtualList,
+  NPagination,
   type DropdownOption,
 } from "naive-ui";
 import PageHeader from "../components/PageHeader.vue";
 import AppIcon from "../components/AppIcon.vue";
 import NodeProgressBar from "../components/NodeProgressBar.vue";
 import ThreadMatrixCard from "../components/ThreadMatrixCard.vue";
-import { errText, invoke } from "../ipc";
+import { errText, invoke, listen, type UnlistenFn } from "../ipc";
 import { isRealFailure, translateErrorCode } from "../utils/errorCode";
 import { PENDING_TASK_NAME, nameFromUri, taskDisplayName } from "../utils/taskName";
 import { readDeleteBehavior, writeDeleteBehavior } from "../utils/deleteBehavior";
 import { useDownloadsStore, type Task } from "../stores/downloads";
 import { useInterceptStore } from "../stores/intercept";
+import { usePluginsStore } from "../stores/plugins";
+import { PAGE_SIZE_EVENT, readPageSize } from "../utils/pageSize";
 
 const store = useDownloadsStore();
-const { list: tasks, composeNonce, composeSeed } = storeToRefs(store);
+const { list: tasks, displayTasks, composeNonce, composeSeed } = storeToRefs(store);
 
 /** 浏览器扩展投递的待确认任务（宿主 `PENDING_INTERCEPT` 的前端镜像）。 */
 const intercept = useInterceptStore();
 const intercepting = computed(() => intercept.pending !== null);
+
+/** 插件状态：右键「插件动作」菜单项来自这里（仅启用且声明 actions 的插件）。 */
+const pluginsStore = usePluginsStore();
 /**
  * 本次关闭弹窗是否保留用户原有草稿。
  *
@@ -33,10 +38,25 @@ const intercepting = computed(() => intercept.pending !== null);
  */
 let preserveDrafts = false;
 
-const url = ref("");
+/**
+ * 下载地址输入（beta11 · F-1）：一个 textarea 承载多行，每行分别创建一个任务。
+ *
+ * 与旧的多输入框相比不再有镜像/备用链接的"同一任务多 URI"语义：
+ * 每行都是独立任务，因此也没有条数上限。
+ */
+const urlLines = ref("");
 const dir = ref("");
 const message = ref("");
 const loading = ref(false);
+
+/** 新建任务高级选项：仅本次任务生效，不写任何持久化。 */
+const advancedOut = ref("");
+const advancedUa = ref("");
+const advancedReferer = ref("");
+/** 自定义 Headers：动态 Key / Value 行，提交时拼成 `Key: Value` 数组。 */
+const headerRows = ref<{ key: string; value: string }[]>([{ key: "", value: "" }]);
+/** beta11 · F-4：本次任务的代理（`options["all-proxy"]`），留空则沿用全局设置。 */
+const advancedProxy = ref("");
 
 /**
  * 未提交输入的草稿键（增量 46）。
@@ -50,22 +70,131 @@ const DRAFT_URL_KEY = "aria2-harness-draft-url";
 /** 写草稿的防抖窗口：连续敲键只在停顿后落一次 localStorage。 */
 const DRAFT_DEBOUNCE_MS = 500;
 
-const composeOpen = ref(false);
-const searchOpen = ref(false);
-const keyword = ref("");
-const twoCol = ref(false);
-const showInfo = ref(true);
-const menuOpen = ref(false);
+// ---------------------------------------------------------------------------
+// 插件虚拟任务（beta10.1：映射成 Task 后与普通任务统一渲染）
+// ---------------------------------------------------------------------------
+
+const PLUGIN_PHASE_TEXT: Record<string, string> = {
+  detecting: "解析中",
+  downloading: "下载分片",
+  merging: "合并中",
+  complete: "已完成",
+  error: "已失败",
+  cancelled: "已取消",
+};
+
+function pluginPhaseLabel(task: Task): string {
+  const phase = task.plugin?.phase ?? "";
+  return PLUGIN_PHASE_TEXT[phase] ?? phase;
+}
+
+/** 虚拟任务是否仍在流转（只有这种状态才提供「取消」）。 */
+function isPluginTaskActive(task: Task): boolean {
+  const phase = task.plugin?.phase ?? "";
+  return phase !== "" && !["complete", "error", "cancelled"].includes(phase);
+}
+
+async function cancelPluginTask(task: Task) {
+  try {
+    await store.cancelPluginTask(task.gid);
+    message.value = `已取消：${fileName(task)}`;
+  } catch (error) {
+    message.value = `取消失败：${errText(error)}`;
+  }
+}
+
+/** beta11 · FF-7：无确定进度的插件任务（直播录制等）改用脉冲条。 */
+function isIndeterminate(task: Task): boolean {
+  return task.plugin?.mode === "indeterminate";
+}
+
+// ---------------------------------------------------------------------------
+// beta11 · FF-8：`plugin://exec` 推送的插件 stderr 最新一行
+// ---------------------------------------------------------------------------
+
+/** pluginId -> 最近一行执行输出（只做轻量展示，不落任何持久化）。 */
+const pluginExecLines = ref<Record<string, string>>({});
+let unlistenExec: UnlistenFn | null = null;
+
+/** 从虚拟任务 id（`plugin:<pluginId>:<seq>`）还原插件 id。 */
+function pluginIdOf(task: Task): string {
+  return /^plugin:([^:]+):/.exec(task.gid)?.[1] ?? "";
+}
+
+/** 活跃插件任务对应的最新执行行；无则返回空串（不展示）。 */
+function pluginExecLine(task: Task): string {
+  if (!task.plugin || !isPluginTaskActive(task)) return "";
+  return pluginExecLines.value[pluginIdOf(task)] ?? "";
+}
 
 /** 分类 Tab：对 store 列表做纯 computed 过滤，不维护多份数组。 */
 type Category = "all" | "active" | "complete" | "error";
-const category = ref<Category>("all");
 const CATEGORY_TABS: { key: Category; label: string }[] = [
   { key: "all", label: "全部" },
   { key: "active", label: "下载中" },
   { key: "complete", label: "已完成" },
   { key: "error", label: "错误" },
 ];
+
+/**
+ * beta9：视图偏好持久化（分栏 / 详细信息 / 分类 Tab）。
+ *
+ * 与删除偏好同样落在 localStorage：升级或重启后仍保持上次的浏览状态，
+ * 不再每次回到「单列 + 显示详情 + 全部」。搜索关键字刻意不持久化 ——
+ * 一次性检索若被记住，下次进入会莫名看到空列表。
+ */
+const UI_PREF_KEY = "aria2-harness-downloads-ui";
+interface UiPrefs {
+  twoCol: boolean;
+  showInfo: boolean;
+  category: Category;
+}
+
+function readUiPrefs(): Partial<UiPrefs> {
+  try {
+    const raw = localStorage.getItem(UI_PREF_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as Partial<UiPrefs>;
+    const prefs: Partial<UiPrefs> = {};
+    if (typeof parsed.twoCol === "boolean") prefs.twoCol = parsed.twoCol;
+    if (typeof parsed.showInfo === "boolean") prefs.showInfo = parsed.showInfo;
+    // 旧版本写入的非法分类直接丢弃，回退到「全部」。
+    if (CATEGORY_TABS.some((tab) => tab.key === parsed.category)) {
+      prefs.category = parsed.category;
+    }
+    return prefs;
+  } catch {
+    return {};
+  }
+}
+
+function writeUiPrefs(patch: Partial<UiPrefs>) {
+  try {
+    localStorage.setItem(UI_PREF_KEY, JSON.stringify({ ...readUiPrefs(), ...patch }));
+  } catch {
+    // 隐私模式 / 配额满：偏好降级为「本次会话有效」。
+  }
+}
+
+const uiPrefs = readUiPrefs();
+
+const composeOpen = ref(false);
+const searchOpen = ref(false);
+const keyword = ref("");
+const twoCol = ref(uiPrefs.twoCol ?? false);
+const showInfo = ref(uiPrefs.showInfo ?? true);
+const menuOpen = ref(false);
+
+const category = ref<Category>(uiPrefs.category ?? "all");
+
+/** 三项视图偏好任一变化即落盘（不监听搜索关键字）。 */
+watch([twoCol, showInfo, category], () => {
+  writeUiPrefs({
+    twoCol: twoCol.value,
+    showInfo: showInfo.value,
+    category: category.value,
+  });
+});
 
 /** 批量选择（gid 集合）；切分类时保留，便于跨 Tab 连续勾选。 */
 const selected = ref<Set<string>>(new Set());
@@ -91,16 +220,53 @@ function inCategory(task: Task, key: Category): boolean {
 }
 
 function categoryCount(key: Category): number {
-  return tasks.value.filter((task) => inCategory(task, key)).length;
+  return displayTasks.value.filter((task) => inCategory(task, key)).length;
 }
 
 const filtered = computed(() => {
   const key = keyword.value.trim().toLowerCase();
-  return tasks.value.filter((task) => {
+  return displayTasks.value.filter((task) => {
     if (!inCategory(task, category.value)) return false;
     return !key || fileName(task).toLowerCase().includes(key);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 分页（beta10.1：传统页码，替代无限滚动的虚拟列表）
+// ---------------------------------------------------------------------------
+
+const pageSize = ref(readPageSize());
+const page = ref(1);
+
+const pageCount = computed(() => Math.max(1, Math.ceil(filtered.value.length / pageSize.value)));
+
+/** 当前页的任务切片：分栏 / 单列都基于它继续切行。 */
+const pageTasks = computed(() => {
+  const start = (page.value - 1) * pageSize.value;
+  return filtered.value.slice(start, start + pageSize.value);
+});
+
+/** 页码越界（清空 / 切分类 / 改每页数量）时收敛到最后一页。 */
+watch([filtered, pageSize], () => {
+  if (page.value > pageCount.value) page.value = pageCount.value;
+  if (page.value < 1) page.value = 1;
+});
+
+// 分类 / 搜索变化回到第一页：否则用户会落在新结果的空页上。
+watch([category, keyword], () => {
+  page.value = 1;
+});
+
+/** 设置页修改每页数量后，同窗口通过自定义事件通知本页即时生效。 */
+function syncPageSize() {
+  const next = readPageSize();
+  if (next === pageSize.value) return;
+  pageSize.value = next;
+  page.value = 1;
+}
+
+onMounted(() => window.addEventListener(PAGE_SIZE_EVENT, syncPageSize));
+onBeforeUnmount(() => window.removeEventListener(PAGE_SIZE_EVENT, syncPageSize));
 
 function toggleSelect(gid: string) {
   const next = new Set(selected.value);
@@ -113,14 +279,17 @@ function clearSelection() {
   selected.value = new Set();
 }
 
+// 「全选」只作用于当前页：跨页全选会让批量操作的目标不可见。
 const allSelected = computed(
-  () => filtered.value.length > 0 && filtered.value.every((task) => selected.value.has(task.gid)),
+  () =>
+    pageTasks.value.length > 0 &&
+    pageTasks.value.every((task) => selected.value.has(task.gid)),
 );
 
 function toggleSelectAll() {
   selected.value = allSelected.value
     ? new Set()
-    : new Set(filtered.value.map((task) => task.gid));
+    : new Set(pageTasks.value.map((task) => task.gid));
 }
 
 function toggleExpand(gid: string) {
@@ -198,23 +367,22 @@ function etaLabel(t: Task): string {
 }
 
 // ---------------------------------------------------------------------------
-// 虚拟滚动（增量 46）
+// 分页切行（beta10.1：每页 tasks 再按单列 / 双列打包）
 // ---------------------------------------------------------------------------
 
-/** 虚拟列表的一"行"：单列模式一行一张卡，分栏模式一行两张卡。 */
+/** 列表的一"行"：单列模式一行一张卡，分栏模式一行两张卡。 */
 interface TaskRow {
   key: string;
   tasks: Task[];
 }
 
 /**
- * 把任务列表按当前分栏状态切成行。
+ * 把当前页任务按分栏状态切成行。
  *
- * 为什么连分栏也算进来：`n-virtual-list` 只有一条纵向轨道，双列布局必须先把两张卡
- * 打包成"一行"，否则卡片会串行堆叠。行高因此天然一致（两列同高）。
+ * 双列布局必须先把两张卡打包成"一行"，否则两列会串行堆叠。
  */
 const rows = computed<TaskRow[]>(() => {
-  const source = filtered.value;
+  const source = pageTasks.value;
   if (!twoCol.value) return source.map((task) => ({ key: task.gid, tasks: [task] }));
   const packed: TaskRow[] = [];
   for (let i = 0; i < source.length; i += 2) {
@@ -224,40 +392,11 @@ const rows = computed<TaskRow[]>(() => {
   return packed;
 });
 
-/**
- * 单行高度（含行间距），与 CSS 里 `.task-card` 的固定高度**必须同步**：
- * - 显示详细信息：156 + 12；
- * - 隐藏详细信息：132 + 12；
- * - 失败卡片多一行错误提示：+24（由 `item-resizable` 实测修正）。
- */
-const itemSize = computed(() => (showInfo.value ? 156 : 132) + 12);
-
-/**
- * 列表可视高度：由外层面板顶部到窗口底部的剩余空间算出。
- *
- * 预留 46px = workspace 底部 14px + page-scroll 底部内边距 32px：
- * 留少了会让整页多出一条无意义的滚动条，虚拟列表反而被撑出视口。
- */
-const listHeight = ref(360);
-const listBox = ref<HTMLElement | null>(null);
-
-function measureList() {
-  const el = listBox.value;
-  if (!el) return;
-  const top = el.getBoundingClientRect().top;
-  listHeight.value = Math.max(220, Math.floor(window.innerHeight - top - 46));
-}
-
-/** 搜索 / 分栏 / 信息开关变化后，行的构成或高度会变，重新量一次。 */
-watch([twoCol, showInfo, () => rows.value.length], () => {
-  void nextTick(measureList);
-});
-
 const activeCount = computed(
-  () => tasks.value.filter((t) => t.status === "active").length,
+  () => displayTasks.value.filter((t) => t.status === "active").length,
 );
 
-const totalCount = computed(() => tasks.value.length);
+const totalCount = computed(() => displayTasks.value.length);
 
 // -- 未提交草稿 --------------------------------------------------------------
 
@@ -292,12 +431,17 @@ let draftTimer: ReturnType<typeof setTimeout> | undefined;
 function scheduleDraftSave() {
   if (draftTimer) clearTimeout(draftTimer);
   draftTimer = setTimeout(() => {
-    writeDraft(DRAFT_URL_KEY, url.value);
+    writeDraft(DRAFT_URL_KEY, draftUrlText());
   }, DRAFT_DEBOUNCE_MS);
 }
 
+/** 草稿文本：直接就是多行输入的原文（空行 / 缩进交给 `writeDraft` 与提交时统一处理）。 */
+function draftUrlText(): string {
+  return urlLines.value;
+}
+
 // 接管预填的是浏览器地址，不属于用户草稿：绝不写进 localStorage。
-watch(url, () => {
+watch(urlLines, () => {
   if (!intercept.pending) scheduleDraftSave();
 });
 
@@ -321,8 +465,11 @@ onBeforeUnmount(() => {
   // 这里立刻补写一次，否则"打完字就点关闭"仍会丢草稿。
   if (draftTimer) clearTimeout(draftTimer);
   if (composeOpen.value && !intercept.pending) {
-    writeDraft(DRAFT_URL_KEY, url.value);
+    writeDraft(DRAFT_URL_KEY, draftUrlText());
   }
+  // FF-8：退订插件执行日志事件，避免视图销毁后回调仍持有旧状态。
+  unlistenExec?.();
+  unlistenExec = null;
 });
 
 /** 打开新建弹窗：拖拽预填 > 未提交草稿。保存路径每次重置为全局默认。 */
@@ -331,14 +478,21 @@ function openCompose() {
   const draftUrl = readDraft(DRAFT_URL_KEY);
   if (seed) {
     // 拖入的地址属于本次操作，必须覆盖草稿；消费一次即清空。
-    url.value = seed;
+    urlLines.value = seed;
     composeSeed.value = "";
   } else if (draftUrl) {
     // 草稿代表"最近一次真实输入"，比上次成功地址更新，优先级更高。
-    url.value = draftUrl;
+    urlLines.value = draftUrl;
+  } else {
+    urlLines.value = "";
   }
   // 路径只是单次覆盖：每次打开都重新回填全局设置里的默认目录。
   dir.value = "";
+  advancedOut.value = "";
+  advancedUa.value = "";
+  advancedReferer.value = "";
+  resetHeaderRows();
+  advancedProxy.value = "";
   void loadDefaultDir();
   composeOpen.value = true;
 }
@@ -383,7 +537,15 @@ watch(
   () => intercept.pending,
   (pending) => {
     if (!pending) return;
-    url.value = pending.url;
+    // 接管极简模式（F-3）：地址只读展示浏览器给的链接；高级区只留 UA/Referer/代理。
+    urlLines.value = pending.url;
+    // UA / Referer 预填成浏览器上下文值，用户可按需改写（清空则回退到 pending 值）。
+    advancedUa.value = pending.user_agent ?? "";
+    advancedReferer.value = pending.referer ?? "";
+    // 其余选项在接管模式下不展示，清掉可能残留的输入，避免误用。
+    advancedOut.value = "";
+    resetHeaderRows();
+    advancedProxy.value = "";
     if (pending.dir) dir.value = pending.dir;
     else {
       dir.value = "";
@@ -453,6 +615,8 @@ function toAbsolutePath(path: string, dir?: string): string {
 }
 
 function filePath(t: Task): string {
+  // 虚拟任务的输出路径由插件在上报事件里给出；未完成时为空。
+  if (t.plugin) return t.plugin.outputPath ?? "";
   const raw = (t.files?.[0]?.path ?? "").trim();
   if (!raw) return "";
   return toAbsolutePath(raw, t.dir);
@@ -476,19 +640,29 @@ function locatePath(t: Task): string {
  * 真实文件名写进 `files[].path` 后自动替换（见 store.updateOne）。
  */
 function fileName(t: Task): string {
-  return taskDisplayName(t);
+  // 插件任务使用插件上报的标题（解析阶段文件名可能还没确定）。
+  return t.plugin?.title || taskDisplayName(t);
 }
 
 function canPause(t: Task): boolean {
+  if (t.plugin) return false;
   return t.status === "active" || t.status === "waiting";
 }
 
 function canResume(t: Task): boolean {
+  if (t.plugin) return false;
   return t.status === "paused";
 }
 
 function statusText(t: Task): string {
+  if (t.plugin) return pluginPhaseLabel(t);
   return STATUS_TEXT[t.status] ?? t.status;
+}
+
+/** 卡片是否按失败配色：引擎错误码 / 插件终态错误统一命中。 */
+function isTaskFailed(t: Task): boolean {
+  if (t.plugin) return t.plugin.phase === "error";
+  return isRealFailure(t.status, t.errorCode);
 }
 
 /** 单线程降级的悬浮说明（与 Rust 侧 mark_single_thread 的语义一致）。 */
@@ -536,6 +710,21 @@ function failureText(t: Task): string {
     : base;
 }
 
+/** beta8.3：403/429 限流由引擎降级为暂停，UI 用黄色温柔提示而不是红色错误。 */
+function isRateLimited(t: Task): boolean {
+  return t.status === "paused" && t.pauseReason === "rate-limit";
+}
+
+/** beta9：网络/代理断开同样由引擎降级为暂停，提示用户检查代理后继续。 */
+function isProxyPaused(t: Task): boolean {
+  return t.status === "paused" && t.pauseReason === "proxy_disconnected";
+}
+
+/** 两类降级暂停共用的卡片高度与琥珀色提示。 */
+function isDegradedPause(t: Task): boolean {
+  return isRateLimited(t) || isProxyPaused(t);
+}
+
 /** 节点进度条语义色：失败红 / 暂停·等待琥珀 / 已移除灰 / 其余青蓝。 */
 function progressTone(t: Task): "ok" | "warn" | "danger" | "idle" {
   if (t.status === "error") return "danger";
@@ -577,8 +766,10 @@ function openRemoveDialog(targets: Task[], required: boolean) {
   if (targets.length === 0) return;
   removeTargets.value = targets;
   removeRequired.value = required;
-  removeWithFiles.value = false;
-  removeRemember.value = false;
+  // beta9：按上次记住的删除偏好回填，重启/更新后不再丢失勾选状态。
+  const behavior = readDeleteBehavior();
+  removeWithFiles.value = behavior === "task-and-file";
+  removeRemember.value = behavior !== "ask";
   removeOpen.value = true;
 }
 
@@ -588,6 +779,7 @@ function openRemoveDialog(targets: Task[], required: boolean) {
  * 下载中 / 等待中的任务永远弹窗确认；其余任务才尊重用户已记住的删除偏好。
  */
 async function requestRemove(t: Task) {
+  // 虚拟任务同样尊重「记住选择」；withFiles 一并交给宿主处理。
   const behavior = readDeleteBehavior();
   const live = isLive(t);
   if (!live && behavior === "task-only") {
@@ -621,9 +813,25 @@ async function confirmRemove() {
   if (targets.length > 1) message.value = `已删除 ${targets.length} 个任务`;
 }
 
-/** 真正执行删除：带文件走新 IPC，仅任务走原 IPC。 */
+/** 弹窗里始终展示「同时删除本地文件」：插件任务同样按 withFiles 交给宿主处理。 */
+const removeCanDeleteFiles = computed(() => removeTargets.value.length > 0);
+
+/** 真正执行删除：虚拟任务走插件 IPC，其余按是否带文件分流。 */
 async function performRemove(t: Task, withFiles: boolean) {
   try {
+    if (t.plugin) {
+      // beta12.1：运行中的虚拟任务必须先取消（宿主会强杀 FFmpeg 并 forceRemove
+      // 底层分片），否则直接删注册表会留下"孤儿下载"在后台偷跑。
+      if (isPluginTaskActive(t)) {
+        await store.cancelPluginTask(t.gid).catch(() => undefined);
+      }
+      await invoke("remove_plugin_task", { id: t.gid, withFiles });
+      store.removePluginTask(t.gid);
+      message.value = withFiles
+        ? `已删除任务及本地文件：${fileName(t)}`
+        : `已删除任务：${fileName(t)}`;
+      return;
+    }
     if (withFiles) {
       await invoke("remove_task_and_files", { gid: t.gid });
     } else {
@@ -702,13 +910,32 @@ async function copyText(text: string): Promise<boolean> {
   }
 }
 
+/**
+ * beta11 · FF-6：已完成任务可用的插件动作。
+ *
+ * 只取启用且声明了 actions 的插件；无动作插件不产生任何菜单项。
+ */
+const ctxPluginActions = computed(() => {
+  const task = ctx.value.task;
+  if (!task || task.status !== "complete") return [];
+  return pluginsStore.plugins
+    .filter((plugin) => plugin.enabled && plugin.actions.length > 0)
+    .flatMap((plugin) =>
+      plugin.actions.map((action) => ({
+        pluginId: plugin.id,
+        actionId: action.id,
+        label: `插件动作：${action.label}`,
+      })),
+    );
+});
+
 const ctxOptions = computed<DropdownOption[]>(() => {
   const task = ctx.value.task;
   const link = downloadLink(task);
   const path = task ? filePath(task) : "";
   const revealPath = task ? locatePath(task) : "";
   const canToggle = Boolean(task && (canPause(task) || canResume(task)));
-  return [
+  const options: DropdownOption[] = [
     { label: "复制下载链接", key: "copy_url", disabled: !link },
     { label: "打开所在文件夹", key: "reveal", disabled: !revealPath },
     { label: "复制文件路径", key: "copy_path", disabled: !path },
@@ -720,14 +947,53 @@ const ctxOptions = computed<DropdownOption[]>(() => {
     },
     { type: "divider", key: "divider-2" },
     { label: "删除任务", key: "remove" },
-    { label: "强制删除", key: "force_remove" },
+    { label: "强制删除", key: "force_remove", disabled: Boolean(task?.plugin) },
   ];
+  if (ctxPluginActions.value.length > 0) {
+    options.push({ type: "divider", key: "divider-plugin" });
+    for (const action of ctxPluginActions.value) {
+      options.push({
+        label: action.label,
+        key: `plugin-action:${action.pluginId}:${action.actionId}`,
+      });
+    }
+  }
+  return options;
 });
+
+/** 把已完成任务交给插件 `onAction` 处理（FF-6）。 */
+async function runPluginAction(pluginId: string, actionId: string, task: Task) {
+  try {
+    await invoke("run_plugin_action", {
+      pluginId,
+      actionId,
+      task: {
+        gid: task.gid,
+        name: fileName(task),
+        path: filePath(task),
+        dir: (task.dir ?? "").trim(),
+      },
+    });
+    message.value = "已提交插件处理";
+  } catch (error) {
+    message.value = `插件处理失败：${errText(error)}`;
+  }
+}
 
 async function onCtxSelect(key: string) {
   const task = ctx.value.task;
   ctx.value.show = false;
   if (!task) return;
+
+  // FF-6：插件动作的 key 形如 `plugin-action:<pluginId>:<actionId>`，
+  // 用当前菜单项回查，避免插件 id / 动作 id 里出现冒号时切分错误。
+  const pluginAction = ctxPluginActions.value.find(
+    (item) => `plugin-action:${item.pluginId}:${item.actionId}` === key,
+  );
+  if (pluginAction) {
+    await runPluginAction(pluginAction.pluginId, pluginAction.actionId, task);
+    return;
+  }
 
   switch (key) {
     case "copy_url": {
@@ -788,38 +1054,145 @@ async function globalReferer(): Promise<string> {
   }
 }
 
+/** Headers 动态行：重置为一行空输入（打开弹窗 / 接管预填时调用）。 */
+function resetHeaderRows() {
+  headerRows.value = [{ key: "", value: "" }];
+}
+
+/** 追加一行 Header 输入。 */
+function addHeaderRow() {
+  headerRows.value.push({ key: "", value: "" });
+}
+
+/** 删除一行；至少保留一行，删空后自动补一个空行。 */
+function removeHeaderRow(index: number) {
+  headerRows.value.splice(index, 1);
+  if (headerRows.value.length === 0) resetHeaderRows();
+}
+
+/** 网盘防盗链预设：百度网盘常见的 UA + Referer 组合。 */
+function fillNetdiskPreset() {
+  advancedUa.value = "netdisk;P2SP;3.0.20.128";
+  advancedReferer.value = "https://pan.baidu.com/";
+}
+
+/**
+ * 提交前收集多行输入里的全部地址。
+ *
+ * 按行拆分、trim、去空、保序去重：每行是一个独立任务，重复地址只建一次。
+ */
+function collectUrls(): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const line of urlLines.value.split(/\r?\n/)) {
+    const text = line.trim();
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    out.push(text);
+  }
+  return out;
+}
+
+/** 实时地址条数：>1 时提示"将分别创建任务"。 */
+const urlCount = computed(() => collectUrls().length);
+
 async function addDownload() {
-  const target = url.value.trim();
-  if (!target) return;
+  const targets = collectUrls();
+  if (targets.length === 0) return;
   // 快照：await 期间宿主可能又收到新一单，不能读实时值做归属判断。
   const pending = intercept.pending;
   loading.value = true;
   try {
-    const options: Record<string, string> = {};
+    const options: Record<string, string | string[]> = {};
+    // 手动重命名优先于引擎的自动识别；空值不提交，交给后端贪婪取名。
+    const outName = advancedOut.value.trim();
+    if (outName) options.out = outName;
+    // 手填的高级选项优先：这是用户对本次任务的显式意图。
+    const ua = advancedUa.value.trim();
+    const referer = advancedReferer.value.trim();
+    if (ua) options["user-agent"] = ua;
+    if (referer) options.referer = referer;
+    // F-4：代理按 aria2 的 all-proxy 下发；空值不写，沿用全局设置。
+    const proxy = advancedProxy.value.trim();
+    if (proxy) options["all-proxy"] = proxy;
+
+    // 自定义 Headers 按行拼成 `Key: Value`：Key 为空整行跳过，Value 允许为空（输出 `Key:`）。
+    const headers = headerRows.value
+      .map((row) => {
+        const key = row.key.trim();
+        if (!key) return "";
+        const value = row.value.trim();
+        return value ? `${key}: ${value}` : `${key}:`;
+      })
+      .filter(Boolean);
+
     if (pending) {
-      // 接管任务：浏览器上下文最高优先，原样交给 aria2 单任务 options。
-      if (pending.referer) options.referer = pending.referer;
-      if (pending.user_agent) options["user-agent"] = pending.user_agent;
+      // 接管任务：浏览器上下文补齐用户未手填的部分。
+      if (pending.referer && !options.referer) options.referer = pending.referer;
+      if (pending.user_agent && !options["user-agent"]) {
+        options["user-agent"] = pending.user_agent;
+      }
+      // beta8.3：扩展嗅探到的完整浏览器请求头优先合并（整行去重，手填行优先）。
+      for (const line of pending.headers ?? []) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        if (!headers.some((exists) => exists.toLowerCase() === trimmed.toLowerCase())) {
+          headers.push(trimmed);
+        }
+      }
       if (pending.cookie) {
         // aria2 的 `header` 要求完整的 `Name: Value` 行；兼容扩展传裸 Cookie 串。
-        options.header = /^cookie:/i.test(pending.cookie)
-          ? pending.cookie
-          : `Cookie: ${pending.cookie}`;
+        // 嗅探头里已带 Cookie 时不再重复追加。
+        const hasCookie = headers.some((line) => /^cookie:/i.test(line));
+        if (!hasCookie) {
+          headers.push(
+            /^cookie:/i.test(pending.cookie) ? pending.cookie : `Cookie: ${pending.cookie}`,
+          );
+        }
       }
-    } else {
+    } else if (!options.referer) {
       // 普通新建：优先下发设置页的全局自定义 Referer；
       // 未设置时留给宿主按内置防盗链规则无感注入。
-      const referer = await globalReferer();
-      if (referer) options.referer = referer;
+      const global = await globalReferer();
+      if (global) options.referer = global;
     }
-    const gid = await invoke<string>("add_download", {
-      url: target,
-      dir: dir.value.trim() || null,
-      options: Object.keys(options).length > 0 ? options : null,
-    });
+    if (headers.length > 0) options.header = headers;
+
+    // F-2：每条链接单独建任务；单条失败不中断其余条，结束后统一汇总。
+    let ok = 0;
+    let lastGid = "";
+    let lastError = "";
+    const failed: string[] = [];
+    for (const target of targets) {
+      try {
+        const gid = await invoke<string>("add_download", {
+          urls: [target],
+          dir: dir.value.trim() || null,
+          options: Object.keys(options).length > 0 ? options : null,
+        });
+        ok += 1;
+        lastGid = gid;
+      } catch (error) {
+        failed.push(target);
+        lastError = errText(error);
+      }
+    }
+
+    if (ok === 0) {
+      // 全部失败：保留输入与弹窗，用户可直接改地址重试。
+      message.value = `添加失败：${lastError || `共 ${targets.length} 个地址均未成功`}`;
+      return;
+    }
+
     // 提示里绝不出现 GID：优先 URL 尾段，取不到就显示"解析中"。
-    message.value = `已添加任务：${nameFromUri(target) || PENDING_TASK_NAME}`;
-    url.value = "";
+    if (failed.length > 0) {
+      message.value = `已添加任务：成功 ${ok} 个 / 失败 ${failed.length} 个`;
+    } else if (targets.length > 1) {
+      message.value = `已添加任务：共 ${ok} 个`;
+    } else {
+      message.value = `已添加任务：${nameFromUri(targets[0]) || PENDING_TASK_NAME}`;
+    }
+    urlLines.value = "";
     if (pending) {
       // 确认成功：清宿主暂存（失败也不阻断入队，下次取消会再清一次）。
       preserveDrafts = true;
@@ -827,9 +1200,13 @@ async function addDownload() {
       intercept.clear();
     }
     composeOpen.value = false;
-    // 立刻把新任务放进 Map，不必等 WS 事件
-    await store.updateOne(gid);
-    store.startPolling();
+    // 插件虚拟任务不在引擎里，不能走 get_task（会报 Invalid GID）；
+    // 它的卡片由 `plugin://task` 事件推入统一下载列表。
+    if (lastGid && !lastGid.startsWith("plugin:")) {
+      // 立刻把最后一个成功的任务放进 Map，不必等 WS 事件；其余交给事件/轮询。
+      await store.updateOne(lastGid);
+      store.startPolling();
+    }
   } catch (error) {
     message.value = `添加失败：${errText(error)}`;
   } finally {
@@ -860,7 +1237,13 @@ async function resumeAll() {
 
 async function clearCompleted() {
   menuOpen.value = false;
-  for (const task of tasks.value.filter((t) => t.status === "complete")) {
+  // 合并列表里的「已完成」既可能来自引擎，也可能是插件虚拟任务，两条链路都要清。
+  for (const task of displayTasks.value.filter((t) => t.status === "complete")) {
+    if (task.plugin) {
+      await invoke("remove_plugin_task", { id: task.gid }).catch(() => undefined);
+      store.removePluginTask(task.gid);
+      continue;
+    }
     await invoke("remove_download", { gid: task.gid }).catch(() => undefined);
     store.remove(task.gid);
   }
@@ -871,13 +1254,23 @@ onMounted(() => {
   void store.initAll().catch(() => {
     // 引擎未就绪时静默失败，WS 连接成功后会重新初始化
   });
-  // 虚拟列表的可视高度依赖窗口尺寸（跨屏拖动 / 最大化都会变），必须跟随 resize。
-  void nextTick(measureList);
-  window.addEventListener("resize", measureList);
-});
-
-onBeforeUnmount(() => {
-  window.removeEventListener("resize", measureList);
+  void store.initPluginTasks();
+  // FF-6：右键「插件动作」依赖插件清单；未加载过（没进过插件页）时补一次。
+  if (pluginsStore.plugins.length === 0) {
+    void pluginsStore.load().catch(() => undefined);
+  }
+  // FF-8：插件执行输出（stderr 逐行）按 pluginId 保存最新一行，供活跃任务卡轻量展示。
+  void listen<{ pluginId: string; program: string; line: string }>(
+    "plugin://exec",
+    (ev) => {
+      const { pluginId, line } = ev.payload;
+      const text = (line ?? "").trim();
+      if (!pluginId || !text) return;
+      pluginExecLines.value = { ...pluginExecLines.value, [pluginId]: text };
+    },
+  ).then((off) => {
+    unlistenExec = off;
+  });
 });
 </script>
 
@@ -988,28 +1381,24 @@ onBeforeUnmount(() => {
 
     <p v-if="message" class="status">{{ message }}</p>
 
-    <section v-if="rows.length > 0" ref="listBox" class="tasks">
-      <!-- naive-ui 2.45 起 NVirtualList 不再接受 height 属性：高度必须落在根节点
-           （style 会透传到内部 NScrollbar），虚列表据此裁剪可视区，否则会撑满全部行、
-           虚拟滚动完全失效。 -->
-      <n-virtual-list
-        :items="rows"
-        :item-size="itemSize"
-        :style="{ height: `${listHeight}px` }"
-        key-field="key"
-        item-resizable
+    <section v-if="filtered.length > 0" class="tasks">
+      <div
+        v-for="item in rows"
+        :key="item.key"
+        class="task-row"
+        :class="{ 'two-col': item.tasks.length > 1 }"
       >
-        <template #default="{ item }">
-          <div class="task-row" :class="{ 'two-col': item.tasks.length > 1 }">
-            <article
-              v-for="task in item.tasks"
-              :key="task.gid"
-              class="task-card"
-              :class="{
-                'no-info': !showInfo,
-                'has-error': isRealFailure(task.status, task.errorCode),
-              }"
-              @contextmenu.prevent="openCtx($event, task)"
+        <article
+          v-for="task in item.tasks"
+          :key="task.gid"
+          class="task-card"
+          :class="{
+            'no-info': !showInfo,
+            'has-error': isTaskFailed(task),
+            'has-rate-limit': isRateLimited(task),
+            'has-degraded-pause': isDegradedPause(task),
+          }"
+          @contextmenu.prevent="openCtx($event, task)"
             >
               <div class="task-main">
                 <label class="task-check" title="选择任务" @click.stop>
@@ -1055,6 +1444,7 @@ onBeforeUnmount(() => {
                     <div class="state-line">
                       <span class="state" :class="task.status">{{ statusText(task) }}</span>
                       <button
+                        v-if="!task.plugin"
                         class="expand-btn"
                         :class="{ open: expanded.has(task.gid) }"
                         :title="expanded.has(task.gid) ? '收起详情' : '展开详情'"
@@ -1070,7 +1460,16 @@ onBeforeUnmount(() => {
                     </div>
                   </div>
 
+                  <!-- FF-7：无确定进度的任务（直播录制等）用脉冲条代替百分比进度 -->
+                  <div
+                    v-if="isIndeterminate(task)"
+                    class="pulse-bar"
+                    :class="{ done: task.status !== 'active' }"
+                  >
+                    <span class="pulse-thumb"></span>
+                  </div>
                   <NodeProgressBar
+                    v-else
                     class="task-progress"
                     :progress="progress(task)"
                     :pieces="task.pieceProgress"
@@ -1079,19 +1478,29 @@ onBeforeUnmount(() => {
                   />
 
                   <div class="meta">
-                    <span class="num">{{ progressLabel(task) }}</span>
-                    <span class="num">{{ human(task.completedLength) }} / {{ sizeLabel(task) }}</span>
-                    <span v-if="task.status === 'active'" class="num speed">
-                      {{ human(task.downloadSpeed) }}/s
-                    </span>
-                    <span v-if="task.status === 'active'" class="num eta">
-                      剩余 {{ etaLabel(task) || "计算中" }}
-                    </span>
-                    <span>{{ task.activeWorkers ?? task.connections }} 连接</span>
+                    <span v-if="!isIndeterminate(task)" class="num">{{ progressLabel(task) }}</span>
+                    <template v-if="task.plugin">
+                      <span class="num">{{ task.plugin.detail || pluginPhaseLabel(task) }}</span>
+                    </template>
+                    <template v-else>
+                      <span class="num">{{ human(task.completedLength) }} / {{ sizeLabel(task) }}</span>
+                      <span v-if="task.status === 'active'" class="num speed">
+                        {{ human(task.downloadSpeed) }}/s
+                      </span>
+                      <span v-if="task.status === 'active'" class="num eta">
+                        剩余 {{ etaLabel(task) || "计算中" }}
+                      </span>
+                      <span>{{ task.activeWorkers ?? task.connections }} 连接</span>
+                    </template>
                   </div>
 
-                  <div v-if="showInfo" class="path" :title="filePath(task)">
-                    {{ filePath(task) || "（路径尚未确定）" }}
+                  <!-- FF-8：活跃插件任务下方展示该插件最新一行执行输出（轻量、可缺省） -->
+                  <p v-if="pluginExecLine(task)" class="exec-line" :title="pluginExecLine(task)">
+                    {{ pluginExecLine(task) }}
+                  </p>
+
+                  <div v-if="showInfo" class="path" :title="filePath(task) || task.plugin?.detail">
+                    {{ filePath(task) || task.plugin?.detail || "（路径尚未确定）" }}
                   </div>
                 </div>
               </div>
@@ -1103,7 +1512,19 @@ onBeforeUnmount(() => {
                 <button v-if="canResume(task)" class="btn-ghost" @click="control('resume', task)">
                   <AppIcon name="play" :size="14" /> 继续
                 </button>
-                <button class="btn-ghost" @click="openFolder(task)">
+                <!-- 虚拟任务只有「取消」：插件阶段没有暂停/继续语义 -->
+                <button
+                  v-if="isPluginTaskActive(task)"
+                  class="btn-ghost"
+                  @click="cancelPluginTask(task)"
+                >
+                  <AppIcon name="close" :size="14" /> 取消
+                </button>
+                <button
+                  v-if="!task.plugin || filePath(task)"
+                  class="btn-ghost"
+                  @click="openFolder(task)"
+                >
                   <AppIcon name="folder" :size="14" /> 打开
                 </button>
                 <button class="btn-ghost danger" @click="requestRemove(task)">
@@ -1144,13 +1565,37 @@ onBeforeUnmount(() => {
                 <AppIcon name="warning" :size="13" />
                 <span>下载失败 · {{ failureText(task) }}</span>
               </p>
+              <!-- 虚拟任务失败：插件回传的错误原文 -->
+              <p v-if="task.plugin?.phase === 'error'" class="err-inline">
+                <AppIcon name="warning" :size="13" />
+                <span>{{ task.plugin.error || "插件任务执行失败" }}</span>
+              </p>
+              <!-- beta8.3：限流降级暂停的温柔提示（黄色），不显示为错误 -->
+              <p v-if="isRateLimited(task)" class="warn-inline">
+                <AppIcon name="warning" :size="13" />
+                <span>服务器拒绝了连接（可能触发了限流）。建议在设置中降低并发数，或稍后点击继续。</span>
+              </p>
+              <!-- beta9：代理/网络断开降级暂停的黄色提示 -->
+              <p v-else-if="isProxyPaused(task)" class="warn-inline">
+                <AppIcon name="warning" :size="13" />
+                <span>网络或代理已断开，请检查后点击继续。</span>
+              </p>
             </article>
-          </div>
-        </template>
-      </n-virtual-list>
+      </div>
     </section>
 
-    <section v-else class="empty-state">
+    <!-- 分页：仅在多页时出现；单页时保持干净的列表 -->
+    <div v-if="pageCount > 1" class="pager" @click.stop>
+      <n-pagination
+        v-model:page="page"
+        :page-count="pageCount"
+        :page-slot="7"
+        :show-quick-jumper="pageCount > 7"
+      />
+      <span class="pager-total num">共 {{ filtered.length }} 项</span>
+    </div>
+
+    <section v-if="filtered.length === 0" class="empty-state">
       <!-- 极简插画：空列表时给一个明确的视觉落点，而不是只有一行字 -->
       <svg class="empty-art" viewBox="0 0 96 72" aria-hidden="true">
         <rect x="14" y="10" width="68" height="50" rx="10" class="art-frame" />
@@ -1188,38 +1633,140 @@ onBeforeUnmount(() => {
       v-model:show="composeOpen"
       preset="card"
       :title="intercepting ? '接管浏览器下载' : '新建下载任务'"
-      style="width: 500px; max-width: 90vw"
+      style="width: 780px; max-width: 94vw"
       :bordered="false"
       :segmented="{ content: 'soft', footer: 'soft' }"
     >
       <p v-if="intercepting" class="compose-desc intercept-desc">
         <AppIcon name="download" :size="14" />
-        浏览器发来的下载请求，已自动填入地址与 Cookie / Referer，确认后开始下载。
+        接管下载：浏览器发来的请求已自动填入地址与 Cookie，可调整 User-Agent / Referer / 代理后开始下载。
       </p>
-      <p v-else class="compose-desc">支持 http / https / ftp / magnet 链接，粘贴后回车即可开始。</p>
-      <form class="compose-form" @submit.prevent="addDownload">
-        <label class="compose-field">
-          <span>下载地址</span>
-          <input
-            v-model="url"
-            type="text"
-            placeholder="https://example.com/file.zip"
-            spellcheck="false"
-            autofocus
-          />
-        </label>
-        <label class="compose-field">
-          <span>保存路径</span>
-          <div class="compose-row">
+      <p v-else class="compose-desc">
+        支持 http / https / ftp / magnet；每行一个链接，将分别创建任务（Ctrl+Enter 开始）。
+      </p>
+      <form class="compose-grid" @submit.prevent="addDownload">
+        <!-- 左栏：本次任务的基础信息 -->
+        <div class="compose-col">
+          <div class="compose-field">
+            <span>
+              下载地址
+              <em v-if="!intercepting && urlCount > 1">
+                已识别 {{ urlCount }} 个链接，将分别创建任务
+              </em>
+            </span>
+            <!-- F-3：接管模式只读展示浏览器地址 -->
             <input
-              v-model="dir"
+              v-if="intercepting"
+              :value="intercept.pending?.url ?? ''"
               type="text"
-              placeholder="默认下载目录"
+              readonly
+              spellcheck="false"
+              class="readonly-url"
+            />
+            <textarea
+              v-else
+              v-model="urlLines"
+              rows="4"
+              placeholder="每行一个链接，将分别创建任务"
+              spellcheck="false"
+              @keydown.ctrl.enter.prevent="addDownload"
+              @keydown.meta.enter.prevent="addDownload"
+            ></textarea>
+          </div>
+          <label v-if="!intercepting" class="compose-field">
+            <span>保存路径</span>
+            <div class="compose-row">
+              <input
+                v-model="dir"
+                type="text"
+                placeholder="默认下载目录"
+                spellcheck="false"
+              />
+              <button type="button" class="btn-ghost" @click="browseDir">浏览</button>
+            </div>
+          </label>
+        </div>
+
+        <!-- 右栏：仅本次任务生效的高级选项 -->
+        <div class="compose-col compose-advanced">
+          <div class="compose-col-title">
+            高级选项
+            <em>仅本次任务生效</em>
+          </div>
+          <label v-if="!intercepting" class="compose-field">
+            <span>重命名 <em>可选</em></span>
+            <input
+              v-model="advancedOut"
+              type="text"
+              placeholder="留空则自动识别文件名"
               spellcheck="false"
             />
-            <button type="button" class="btn-ghost" @click="browseDir">浏览</button>
-          </div>
-        </label>
+          </label>
+          <label class="compose-field">
+            <span>User-Agent <em>可选</em></span>
+            <input
+              v-model="advancedUa"
+              type="text"
+              placeholder="留空则沿用全局设置"
+              spellcheck="false"
+            />
+          </label>
+          <label class="compose-field">
+            <span>Referer <em>可选</em></span>
+            <input
+              v-model="advancedReferer"
+              type="text"
+              placeholder="留空则沿用全局设置"
+              spellcheck="false"
+            />
+          </label>
+          <label class="compose-field">
+            <span>代理 <em>可选</em></span>
+            <input
+              v-model="advancedProxy"
+              type="text"
+              placeholder="http://127.0.0.1:7890"
+              spellcheck="false"
+            />
+          </label>
+          <template v-if="!intercepting">
+            <div class="compose-field">
+              <span>自定义 Headers <em>每行一个 Key / Value</em></span>
+              <div class="header-rows">
+                <div v-for="(row, index) in headerRows" :key="index" class="header-row">
+                  <input
+                    v-model="row.key"
+                    type="text"
+                    class="header-key"
+                    placeholder="Key"
+                    spellcheck="false"
+                  />
+                  <input
+                    v-model="row.value"
+                    type="text"
+                    class="header-value"
+                    placeholder="Value"
+                    spellcheck="false"
+                  />
+                  <button
+                    type="button"
+                    class="icon-btn header-del"
+                    title="删除这一行"
+                    @click="removeHeaderRow(index)"
+                  >
+                    <AppIcon name="close" :size="14" />
+                  </button>
+                </div>
+              </div>
+              <button type="button" class="btn-ghost header-add" @click="addHeaderRow">
+                <AppIcon name="plus" :size="14" /> 添加 Header
+              </button>
+            </div>
+            <button type="button" class="btn-ghost preset-btn" @click="fillNetdiskPreset">
+              填入网盘预设
+            </button>
+          </template>
+        </div>
       </form>
 
       <template #footer>
@@ -1228,7 +1775,7 @@ onBeforeUnmount(() => {
           <button
             type="button"
             class="btn-primary"
-            :disabled="loading || !url.trim()"
+            :disabled="loading || urlCount === 0"
             @click="addDownload"
           >
             {{ loading ? "添加中..." : "开始下载" }}
@@ -1257,7 +1804,7 @@ onBeforeUnmount(() => {
         {{ fileName(removeTargets[0]) }}
       </p>
       <div class="delete-options">
-        <n-checkbox v-model:checked="removeWithFiles">
+        <n-checkbox v-if="removeCanDeleteFiles" v-model:checked="removeWithFiles">
           同时删除本地文件（不可恢复）
         </n-checkbox>
         <n-checkbox v-if="!removeRequired" v-model:checked="removeRemember">
@@ -1473,13 +2020,41 @@ onBeforeUnmount(() => {
 }
 
 /*
- * 虚拟滚动（增量 46）：`.tasks` 不再是 grid，而是「固定高度的滚动视口」；
- * 行高由脚本里的 `itemSize` 估算，展开 / 失败行由 `item-resizable` 实测修正。
- * 卡片因此用 min-height 而不是固定 height —— 展开面板才能撑高自身。
+ * 分页列表（beta10.1）：`.tasks` 是固定高度的滚动视口，只有列表内部滚动，
+ * 外层容器保持锁定；页码条固定在列表下方，不随卡片滚动。
  */
+.view-downloads {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
 .tasks {
   margin-top: 4px;
   padding-right: 2px;
+  /* 占满剩余高度，超出一页的卡片在容器内部滚动。 */
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+/* 页码条：列表下方居中，单页时不出现。 */
+.pager {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 10px 0 4px;
+  flex: none;
+}
+
+.pager-total {
+  font-size: 11.5px;
+  color: var(--muted);
 }
 
 .task-row {
@@ -1490,7 +2065,7 @@ onBeforeUnmount(() => {
   gap: 12px;
   box-sizing: border-box;
   padding-bottom: 12px;
-  /* n-virtual-list 的条目轨道宽度由内容决定：显式铺满，卡片才不会按文字宽度收缩。 */
+  /* 卡片按容器宽度铺满，不随文字宽度收缩。 */
   width: 100%;
   min-width: 0;
 }
@@ -1503,7 +2078,7 @@ onBeforeUnmount(() => {
   min-height: 156px;
   padding: 14px 16px;
   border: 1px solid var(--line);
-  border-radius: var(--r-card);
+  border-radius: 12px;
   background: var(--surface-2);
   transition:
     border-color 0.15s ease,
@@ -1516,6 +2091,14 @@ onBeforeUnmount(() => {
   min-height: 180px;
 }
 .task-card.no-info.has-error {
+  min-height: 156px;
+}
+.task-card.has-rate-limit,
+.task-card.has-degraded-pause {
+  min-height: 180px;
+}
+.task-card.no-info.has-rate-limit,
+.task-card.no-info.has-degraded-pause {
   min-height: 156px;
 }
 .task-card:hover {
@@ -1771,6 +2354,56 @@ onBeforeUnmount(() => {
   margin-top: 10px;
 }
 
+/* FF-7：无确定进度的任务用跳动脉冲条代替百分比条。 */
+.pulse-bar {
+  position: relative;
+  height: 8px;
+  margin-top: 10px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--line) 55%, transparent);
+}
+
+.pulse-thumb {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 34%;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+  opacity: 0.85;
+  animation: pulse-slide 1.3s ease-in-out infinite;
+}
+
+/* 终态不再"跳动"，只留一条静态满条，避免误导用户以为还在处理。 */
+.pulse-bar.done .pulse-thumb {
+  width: 100%;
+  opacity: 0.4;
+  animation: none;
+}
+
+@keyframes pulse-slide {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(320%);
+  }
+}
+
+/* FF-8：活跃插件任务的最新一行执行输出（小字、单行省略）。 */
+.exec-line {
+  margin: 4px 0 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 10.5px;
+  color: var(--muted);
+  opacity: 0.75;
+}
+
 .meta {
   display: flex;
   gap: 14px;
@@ -1835,6 +2468,22 @@ onBeforeUnmount(() => {
   color: #d32f2f;
 }
 .err-inline svg {
+  flex: none;
+  margin-top: 1px;
+}
+
+/* 限流提示：无背景，琥珀色一行注释（beta8.3） */
+.warn-inline {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 7px 0 0;
+  padding-left: 78px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: #b26a00;
+}
+.warn-inline svg {
   flex: none;
   margin-top: 1px;
 }
@@ -1918,10 +2567,23 @@ onBeforeUnmount(() => {
   color: var(--accent, #14b8a6);
 }
 
-.compose-form {
+/* 双栏：左基础信息 / 右高级选项，窄屏自动折叠为单栏。 */
+.compose-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.05fr) minmax(0, 0.95fr);
+  gap: 20px;
+  align-items: start;
+}
+
+.compose-col {
   display: flex;
   flex-direction: column;
   gap: 14px;
+  min-width: 0;
+  /* 高级选项再多也不顶穿底部按钮：栏内独立滚动。 */
+  max-height: 70vh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .compose-field {
@@ -1948,6 +2610,107 @@ onBeforeUnmount(() => {
   width: 100%;
   height: 40px;
   font-size: 13px;
+}
+
+.compose-field textarea {
+  width: 100%;
+  min-height: 76px;
+  padding: 10px 12px;
+  font-size: 12.5px;
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  line-height: 1.6;
+  resize: vertical;
+}
+
+/* 右栏视觉分组：淡底板把"仅本次任务生效"的选项与基础信息区分开。 */
+.compose-advanced {
+  gap: 12px;
+  padding: 14px;
+  border-radius: 12px;
+  background: var(--surface-2, rgba(127, 127, 127, 0.06));
+  overscroll-behavior: contain;
+}
+
+/* Headers 动态行：Key 窄、Value 宽，行尾删除按钮固定尺寸。 */
+.header-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.header-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.compose-field .header-row input {
+  width: auto;
+  height: 34px;
+  font-size: 12.5px;
+}
+
+.compose-field .header-key {
+  flex: 0 1 34%;
+  min-width: 0;
+}
+
+.compose-field .header-value {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.header-del {
+  flex: none;
+  width: 30px;
+  height: 30px;
+}
+
+.header-add {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 12px;
+  border-radius: var(--r-btn);
+}
+
+.compose-col-title {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+.compose-col-title em {
+  font-style: normal;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--muted);
+}
+
+/* F-3：接管模式下的只读地址（视觉上明确不可编辑）。 */
+.readonly-url {
+  color: var(--muted);
+  background: var(--surface-3);
+  cursor: default;
+}
+
+@media (max-width: 720px) {
+  .compose-grid {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 14px;
+  }
+}
+
+.preset-btn {
+  align-self: flex-start;
+  height: 32px;
+  padding: 0 12px;
+  border-radius: var(--r-btn);
 }
 
 .compose-row {
@@ -1996,8 +2759,9 @@ onBeforeUnmount(() => {
 }
 
 @media (max-width: 1100px) {
-  .tasks.two-col {
-    grid-template-columns: 1fr;
+  .task-row.two-col {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 </style>
+

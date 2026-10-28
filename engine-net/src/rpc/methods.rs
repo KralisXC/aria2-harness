@@ -4,7 +4,7 @@
 //! 只做 §5.4.5 的最小集；`system.multicall` 内部逐条调用，禁止递归嵌套。
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -511,10 +511,17 @@ impl Engine {
                 "dir 必须是绝对路径（收到 `{dir}`）"
             )));
         }
-        let out = local(options, "out")
+        // 显式 out 优先级最高（用户意图），但必须清洗 Windows 非法字符：
+        // 用户可能把 `/`、`:` 或 `?` 粘贴进文件名，不能带进 dest。
+        let explicit_out = local(options, "out")
             .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| out_name(&uris[0]));
-        let dest = PathBuf::from(&dir).join(out);
+            .map(|value| crate::task::naming::sanitize_name(&value))
+            .filter(|value| !value.is_empty());
+        let out = explicit_out.clone().unwrap_or_else(|| {
+            crate::task::naming::resolve_out_name(None, None, &uris[0], &uris[0])
+        });
+        // 260 字符上限：保留后缀截断主体，避免 tokio::fs 直接 os error 3。
+        let dest = crate::task::naming::fit_windows_path(Path::new(&dir), &out);
 
         let mut http = HttpOptions::default();
         if let Some(user_agent) = local(options, "user-agent")
@@ -576,7 +583,13 @@ impl Engine {
         {
             http.retry_wait = Duration::from_secs(secs);
         }
-        http.headers = parse_headers(options.get("header"));
+        // 自定义请求头：任务级优先，其次全局（设置页 `header`）。
+        // 全局值可能是多行字符串，`parse_headers` 会逐行拆分。
+        let header_source = options
+            .get("header")
+            .cloned()
+            .or_else(|| globals.get("header").cloned().map(Value::String));
+        http.headers = parse_headers(header_source.as_ref())?;
 
         // Phase 3：代理（--all-proxy / --http-proxy / --https-proxy / --no-proxy）。
         http.proxy = parse_proxy_settings(options, &globals)?;
@@ -620,6 +633,7 @@ impl Engine {
         Ok(TaskSpec {
             uris,
             dest,
+            explicit_out: explicit_out.is_some(),
             http,
             piece_length,
             slicing,
@@ -888,36 +902,71 @@ fn value_to_string(value: &Value) -> Option<String> {
     }
 }
 
-fn parse_headers(value: Option<&Value>) -> Vec<(String, String)> {
+/// 解析 `header` 选项：字符串或字符串数组，每个元素都按行拆分（`\r\n` / `\n`）。
+///
+/// 之所以在 addUri 阶段就校验：非法头名 / 头值若留到真正发请求时才报错，用户看到的
+/// 是"任务已添加但下载失败"，定位成本高得多。
+fn parse_headers(value: Option<&Value>) -> Result<Vec<(String, String)>, RpcError> {
     let mut headers = Vec::new();
-    let mut push = |item: &Value| {
-        let Some(text) = value_to_string(item) else {
-            return;
-        };
-        if let Some((name, header_value)) = text.split_once(':') {
-            headers.push((name.trim().to_string(), header_value.trim().to_string()));
-        }
-    };
     match value {
-        Some(Value::Array(items)) => items.iter().for_each(&mut push),
-        Some(other) => push(other),
+        Some(Value::Array(items)) => {
+            for item in items {
+                if let Some(text) = value_to_string(item) {
+                    push_header_lines(&mut headers, &text)?;
+                }
+            }
+        }
+        Some(other) => {
+            if let Some(text) = value_to_string(other) {
+                push_header_lines(&mut headers, &text)?;
+            }
+        }
         None => {}
     }
-    headers
+    Ok(headers)
 }
 
-/// `http://a.test/dir/file.bin?x=1` → `file.bin`；无文件名时退回 `index.html`。
-fn out_name(uri: &str) -> String {
-    let path = uri
-        .parse::<http::Uri>()
-        .map(|parsed| parsed.path().to_string())
-        .unwrap_or_else(|_| uri.split(['?', '#']).next().unwrap_or_default().to_string());
-    let name = path.rsplit('/').next().unwrap_or_default();
-    if name.is_empty() {
-        "index.html".to_string()
-    } else {
-        name.to_string()
+fn push_header_lines(headers: &mut Vec<(String, String)>, text: &str) -> Result<(), RpcError> {
+    for line in text.split(['\r', '\n']) {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((name, header_value)) = line.split_once(':') else {
+            return Err(RpcError::invalid_params(format!(
+                "请求头格式非法（缺少冒号）：`{line}`，每行应为 `Key: Value`"
+            )));
+        };
+        let name = name.trim();
+        let header_value = header_value.trim();
+        if name.is_empty() {
+            return Err(RpcError::invalid_params(format!(
+                "请求头名不能为空：`{line}`"
+            )));
+        }
+        if http::header::HeaderName::from_bytes(name.as_bytes()).is_err() {
+            return Err(RpcError::invalid_params(format!(
+                "非法请求头名 `{name}`"
+            )));
+        }
+        if http::header::HeaderValue::from_str(header_value).is_err() {
+            return Err(RpcError::invalid_params(format!(
+                "非法请求头值（`{name}`）：含不可用于 HTTP 的字符"
+            )));
+        }
+        headers.push((name.to_string(), header_value.to_string()));
     }
+    Ok(())
+}
+
+/// `http://a.test/dir/file.bin?x=1` → `file.bin`。
+///
+/// beta8.3 起统一的命名裁决在 [`crate::task::naming::resolve_out_name`]：
+/// 建任务时只掌握原始 URL，因此这里等价于「原始 = 最终」的临时名；
+/// 任务启动后 registry 会用响应头 / 最终 URL 再裁决一次。
+#[cfg(test)]
+fn out_name(uri: &str) -> String {
+    crate::task::naming::resolve_out_name(None, None, uri, uri)
 }
 
 #[cfg(test)]
@@ -927,22 +976,106 @@ mod tests {
     #[test]
     fn derives_out_name_from_uri() {
         assert_eq!(out_name("http://a.test/x/file.bin?token=1"), "file.bin");
-        assert_eq!(out_name("http://a.test/"), "index.html");
-        assert_eq!(out_name("http://a.test"), "index.html");
+        // 无文件名 → 时间戳兜底名。
+        assert!(out_name("http://a.test/").starts_with("Download_"));
+        assert!(out_name("http://a.test").starts_with("Download_"));
+    }
+
+    /// 中文按百分号编码进 URL 时必须还原成可读文件名。
+    #[test]
+    fn decodes_percent_encoded_names() {
+        assert_eq!(out_name("http://a.test/%E4%B8%AD%E6%96%87.zip"), "中文.zip");
+        assert_eq!(out_name("http://a.test/a%20b.zip"), "a b.zip");
+        // 非法百分号序列原样保留，不能被吞掉。
+        assert_eq!(out_name("http://a.test/100%zz.zip"), "100%zz.zip");
+    }
+
+    /// Windows 非法字符必须清洗，不能把路径分隔符带进文件名。
+    #[test]
+    fn sanitizes_windows_illegal_chars() {
+        assert_eq!(out_name("http://a.test/a%3Ab%2Fc.zip"), "a_b_c.zip");
+        assert_eq!(out_name("http://a.test/a%2A%3F.zip"), "a__.zip");
+        // `.` / `..` 等路径穿越名清洗后为空，走兜底名。
+        assert!(out_name("http://a.test/..").starts_with("Download_"));
+    }
+
+    /// GitHub Release 直链的哈希尾段 → 时间戳兜底名；短名保持原样。
+    #[test]
+    fn opaque_names_fall_back_to_timestamp() {
+        assert!(out_name(
+            "https://github.com/x/y/releases/download/v1/abc123def4567890abcdef"
+        )
+        .starts_with("Download_"));
+        assert_eq!(out_name("http://a.test/word"), "word");
+        assert_eq!(out_name("http://a.test/LICENSE"), "LICENSE");
     }
 
     #[test]
     fn headers_accept_string_and_array() {
         assert_eq!(
-            parse_headers(Some(&json!("X-A: 1"))),
+            parse_headers(Some(&json!("X-A: 1"))).unwrap(),
             vec![("X-A".to_string(), "1".to_string())]
         );
         assert_eq!(
-            parse_headers(Some(&json!(["X-A: 1", "X-B: 2"]))),
+            parse_headers(Some(&json!(["X-A: 1", "X-B: 2"]))).unwrap(),
             vec![
                 ("X-A".to_string(), "1".to_string()),
                 ("X-B".to_string(), "2".to_string())
             ]
+        );
+    }
+
+    /// 设置页的多行文本与浏览器扩展的数组，都必须拆成逐条 header。
+    #[test]
+    fn headers_split_multiline_text() {
+        assert_eq!(
+            parse_headers(Some(&json!("X-A: 1\r\nX-B: 2\n\n  X-C : 3  "))).unwrap(),
+            vec![
+                ("X-A".to_string(), "1".to_string()),
+                ("X-B".to_string(), "2".to_string()),
+                ("X-C".to_string(), "3".to_string())
+            ]
+        );
+        assert_eq!(
+            parse_headers(Some(&json!(["X-A: 1\nX-B: 2"]))).unwrap(),
+            vec![
+                ("X-A".to_string(), "1".to_string()),
+                ("X-B".to_string(), "2".to_string())
+            ]
+        );
+    }
+
+    /// 非法行必须在 addUri 阶段被拒绝，而不是等到发请求才失败。
+    #[test]
+    fn headers_reject_invalid_lines() {
+        assert!(parse_headers(Some(&json!("NoColonHere"))).is_err());
+        assert!(parse_headers(Some(&json!(": empty-name"))).is_err());
+        assert!(parse_headers(Some(&json!("Bad Name: 1"))).is_err());
+        assert!(parse_headers(Some(&json!("X-A: a\nb"))).is_err());
+    }
+
+    /// 多 URI：镜像数组原样保留，且共用同一份 Header 与落盘路径。
+    #[test]
+    fn multi_uri_shares_headers_and_dest() {
+        let engine = empty_engine();
+        let dir = std::env::temp_dir();
+        let mut options = Map::new();
+        options.insert("dir".to_string(), json!(dir.to_string_lossy()));
+        options.insert("header".to_string(), json!(["Cookie: a=1"]));
+        let spec = engine
+            .build_spec(
+                vec![
+                    "https://a.test/game.zip".to_string(),
+                    "https://b.test/game.zip".to_string(),
+                ],
+                &options,
+            )
+            .expect("spec");
+        assert_eq!(spec.uris.len(), 2);
+        assert_eq!(spec.dest, dir.join("game.zip"));
+        assert_eq!(
+            spec.http.headers,
+            vec![("Cookie".to_string(), "a=1".to_string())]
         );
     }
 

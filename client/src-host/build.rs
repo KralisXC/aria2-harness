@@ -92,6 +92,7 @@ fn find_windres() -> Option<PathBuf> {
     }
 
     [
+        r"D:\msys2\mingw64\bin\windres.exe",
         r"C:\msys64\mingw64\bin\windres.exe",
         r"C:\msys64\ucrt64\bin\windres.exe",
         r"C:\msys64\clang64\bin\llvm-windres.exe",

@@ -188,6 +188,12 @@ withDefaults(
       <path d="M9 2h6" />
     </template>
 
+    <template v-else-if="name === 'terminal'">
+      <rect x="3" y="4" width="18" height="16" rx="2" />
+      <path d="m7 9 3 3-3 3" />
+      <path d="M13 15h4" />
+    </template>
+
     <template v-else-if="name === 'shield'">
       <path d="M12 3 4 6v5c0 5 3.4 8.4 8 10 4.6-1.6 8-5 8-10V6l-8-3Z" />
       <path d="m9 12 2 2 4-4" />

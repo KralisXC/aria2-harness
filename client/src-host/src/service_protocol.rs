@@ -44,6 +44,11 @@ pub enum ServiceRequest {
     StartEngine { port: u16 },
     /// 查询引擎状态（是否在运行、进程 PID）。
     GetStatus,
+    /// 原地更新 6800 对外密钥（热更新，不重启引擎、不断开连接）。
+    ///
+    /// 仅代理档（`auto` / `native`）支持；回滚档（`--engine=aria2`）的密钥是
+    /// aria2c 启动参数，在线修改必然要求重启引擎，服务会明确拒绝。
+    SetSecret { secret: String },
     /// 优雅关闭引擎并让 Service 自身退出。**幂等**：重复调用不报错。
     Shutdown,
 }
@@ -171,6 +176,9 @@ mod tests {
         let reqs = [
             ServiceRequest::StartEngine { port: 6800 },
             ServiceRequest::GetStatus,
+            ServiceRequest::SetSecret {
+                secret: "new-secret".to_string(),
+            },
             ServiceRequest::Shutdown,
         ];
         for req in reqs {
@@ -202,6 +210,11 @@ mod tests {
         let req = ServiceRequest::GetStatus;
         assert_eq!(decode_request(&encode_request(&req).unwrap()).unwrap(), req);
 
+        let req = ServiceRequest::SetSecret {
+            secret: "n3w-s3cret".to_string(),
+        };
+        assert_eq!(decode_request(&encode_request(&req).unwrap()).unwrap(), req);
+
         let req = ServiceRequest::Shutdown;
         assert_eq!(decode_request(&encode_request(&req).unwrap()).unwrap(), req);
     }
@@ -224,6 +237,12 @@ mod tests {
     fn wire_format_is_locked() {
         let line = encode_request(&ServiceRequest::StartEngine { port: 6800 }).unwrap();
         assert_eq!(line, "{\"cmd\":\"start_engine\",\"port\":6800}\n");
+
+        let line = encode_request(&ServiceRequest::SetSecret {
+            secret: "abc".to_string(),
+        })
+        .unwrap();
+        assert_eq!(line, "{\"cmd\":\"set_secret\",\"secret\":\"abc\"}\n");
 
         let line = encode_response(&ServiceResponse::engine_started("s".repeat(3), 7)).unwrap();
         assert_eq!(

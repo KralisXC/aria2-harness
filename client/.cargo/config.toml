@@ -1,27 +1,44 @@
-# 纯 Clang/LLVM 工具链（gnullvm）配置 —— 可选，显式 opt-in
+# 增量 26 · 阶段二：纯 Clang/LLVM 工具链（gnullvm）配置
 #
-# ⚠️ 刻意**不设置全局 `[build] target`**：
-#    那样会让 `cargo build` 默认走 gnullvm，日常 MSVC 开发闭环会被 disrupt。
-#    仅在需要 gnullvm 时显式指定：
-#      cargo build --target x86_64-pc-windows-gnullvm --features native-http,wasm-runtime
+# ⚠️ 刻意**不设置全局 `[build] target`**。
+#    设了它会让 `cargo build` 默认走 gnullvm —— 而 rquickjs（QuickJS 是 C 源码，
+#    由 `cc` crate 编译）在本机**没有任何 C 编译器**（clang/clang-cl/cc/gcc 全缺）
+#    时会直接编译失败，把日常 MSVC 开发闭环一并打碎。
+#    因此 gnullvm 是**显式 opt-in**：
+#      cargo check --target x86_64-pc-windows-gnullvm --features wasm-runtime
 #
-# 使用前提（三个都必须满足）：
-#   1. rust-std / rust-mingw 的 gnullvm 组件已安装到当前 toolchain。
-#   2. `rust-lld` 不在 PATH（它随 host toolchain 分发）。请把
-#      `<RUSTUP_HOME>/toolchains/<host>/lib/rustlib/x86_64-pc-windows-msvc/bin`
-#      加入 PATH，或把下面的 `linker` 改成你自己机器上的绝对路径。
-#   3. `clang` 必须可达（rquickjs 的 QuickJS 是 C 源码，由 `cc` crate 编译）。
-#      clang 在 `*-windows-gnu*` 目标下会通过 PATH 找 GCC 安装来推导 sysroot，
-#      因此 PATH 里还要有 MSYS2 的 `mingw64/bin`；找不到 advapi32 等导入库时，
-#      把下面的 `-Clink-arg` 改成你的 MSYS2 `<root>/mingw64/lib` 再取消注释。
-#
-# 构建脚本会用到 libclang（rquickjs 的 bindgen），请自行设置环境变量：
-#   LIBCLANG_PATH=<LLVM_ROOT>\bin
+# 使用前提（本机实测结论，详见 report_txt/Ditch_Tauri_Implementation.md）：
+#   1. `rust-std` + `rust-mingw` 的 gnullvm 组件需**手工安装**：
+#      清华镜像 404，且本机 rustup 无视 RUSTUP_DIST_SERVER（镜像地址被写死在别处），
+#      故改为 USTC 源直接下载 tar.xz 解包进 toolchain。
+#   2. `rust-lld` 可胜任 COFF 链接，但必须显式 `-Clink-self-contained=yes`；
+#      否则 lld 拿不到 self-contained 搜索路径，报
+#      `unable to find library -lkernel32 / -lmingw32 / -lmingwwex / -lunwind`。
+#   3. `linker` 用绝对路径：`rust-lld.exe` 不在 PATH（随 host toolchain 分发）。
+#   4. `+crt-static`：强制静态链接 CRT 与 `libunwind.a`。缺它会解析到
+#      `libunwind.dll.a` → 运行期 `0xC0000135 STATUS_DLL_NOT_FOUND`（编译不受影响）。
+#   5. C 编译器：`clang` 必须可达（rquickjs 的 QuickJS 是 C 源码，由 `cc` crate 编译）。
+#      若 PATH 里没有，用 `$env:PATH="D:\LLVM\bin;"+$env:PATH; $env:CC="clang"` 兜底。
+#   6. `-Clink-arg=-LD:\msys2\mingw64\lib`：`rust-mingw` 的 self-contained 集合只随附
+#      kernel32/mingw32/mingwex/msvcrt/ntdll/user32/userenv/ws2_32/dbghelp/unwind，
+#      **没有 advapi32**；而 wry/webview2-com 的 `windows` 传递依赖要 `-ladvapi32`
+#      → 报 `lld: error: unable to find library -ladvapi32`。
+#      用 `-C link-arg` 而非 `-Lnative`：link-arg 排在 rustc 自有 `-L` 之后，
+#      故 self-contained 仍优先命中 kernel32 等，仅从 MSYS2 补缺失的那几个导入库。
 [target.x86_64-pc-windows-gnullvm]
-linker = "rust-lld.exe"
-rustflags = [
-    "-Clink-self-contained=yes",
-    "-Ctarget-feature=+crt-static",
-    # 缺 advapi32 等导入库时按需启用（路径换成自己的 MSYS2）：
-    # "-Clink-arg=-L<MSYS2_ROOT>/mingw64/lib",
-]
+linker = "C:\\Users\\33079\\.rustup\\toolchains\\stable-x86_64-pc-windows-msvc\\lib\\rustlib\\x86_64-pc-windows-msvc\\bin\\rust-lld.exe"
+rustflags = ["-Clink-self-contained=yes", "-Ctarget-feature=+crt-static", "-Clink-arg=-LD:\\msys2\\mingw64\\lib"]
+
+# 增量 26 · 阶段二（续）：C 侧工具链环境（仅影响 gnullvm 目标，MSVC 构建不受影响）。
+#
+# 关键结论（实测）：clang 在 `*-windows-gnu*` 目标下会**通过 PATH 定位 GCC 安装**
+# 来推导 MinGW 头文件 sysroot。因此仅装 LLVM（只有 D:\LLVM\bin 在 PATH）时，
+# `--target=x86_64-pc-windows-gnu` 找不到 stdlib.h；把 D:\msys2\mingw64\bin 一并
+# 放进 PATH 后，clang 自动追加 D:\msys2\mingw64\include —— **仍是纯 clang，无需换成 gcc**。
+#
+# 前提：运行 gnullvm 构建前，PATH 必须同时含 `D:\LLVM\bin` 与 `D:\msys2\mingw64\bin`
+#       （clang 找 MSYS2 sysroot；cc 的 `ar` 亦来自 MSYS2）。
+#       另需 `LIBCLANG_PATH`（下方自动注入），供 rquickjs 的 bindgen 使用。
+[env]
+# rquickjs-sys 在 gnullvm 下未内置 bindings，改用 bindgen 构建期生成 → 需要 libclang。
+LIBCLANG_PATH = "D:\\LLVM\\bin"

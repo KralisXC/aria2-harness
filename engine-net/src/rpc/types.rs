@@ -115,6 +115,10 @@ pub fn status_to_value(snapshot: &TaskSnapshot) -> Value {
         }],
     });
 
+    // beta8.3：限流降级暂停原因（aria2 无此字段，前端按需读取）。
+    if let Some(reason) = &snapshot.pause_reason {
+        value["pauseReason"] = json!(reason);
+    }
     if snapshot.error_code.is_some() {
         value["status"] = json!(TaskStatus::Error.as_aria2());
     }
@@ -142,6 +146,7 @@ mod tests {
             piece_progress: vec![100, 40],
             active_workers: 2,
             eta: 0,
+            pause_reason: None,
         };
         let value = status_to_value(&snapshot);
         assert_eq!(value["totalLength"], "100");
@@ -154,6 +159,29 @@ mod tests {
         assert_eq!(value["eta"], "0");
         assert_eq!(value["files"][0]["uris"][0]["uri"], "http://a.test/a.bin");
         assert_eq!(value["files"][0]["uris"][0]["status"], "used");
+    }
+
+    #[test]
+    fn pause_reason_is_exposed() {
+        let snapshot = TaskSnapshot {
+            gid: "fffe000000000002".into(),
+            status: TaskStatus::Paused,
+            total_length: 100,
+            completed_length: 40,
+            download_speed: 0,
+            dest: PathBuf::from("C:/tmp/b.bin"),
+            uris: vec!["http://a.test/b.bin".into()],
+            error_code: None,
+            error_message: None,
+            piece_length: 1024,
+            piece_progress: vec![100, 40],
+            active_workers: 0,
+            eta: 0,
+            pause_reason: Some("rate-limit".into()),
+        };
+        let value = status_to_value(&snapshot);
+        assert_eq!(value["status"], "paused");
+        assert_eq!(value["pauseReason"], "rate-limit");
     }
 
     #[test]

@@ -30,6 +30,19 @@ pub enum PluginJob {
     },
     /// 一次 hook 调用（载荷为 POD JSON）。
     Hook { hook: String, payload: Value },
+    /// 长任务 hook（`onTaskRun`）：使用 manifest 的 `taskTimeoutMs` 预算。
+    TaskHook {
+        hook: String,
+        payload: Value,
+        budget_ms: u64,
+    },
+    /// 需要同步回执的 hook（`onTaskDetected`）：插件返回的 `{claim:true/false}` 经 `reply` 回传。
+    Detect {
+        hook: String,
+        payload: Value,
+        budget_ms: u64,
+        reply: SyncSender<Result<Option<Value>, String>>,
+    },
     /// 优雅退出（触发 onShutdown 后线程结束）。
     Shutdown,
 }
@@ -43,6 +56,9 @@ pub struct Subscriber {
     pub hooks: Arc<HashSet<String>>,
     /// 运行时启停开关；关闭时派发阶段直接跳过该插件。
     pub enabled: Arc<AtomicBool>,
+    /// 懒激活状态（beta12 · 模块 E）：声明 `activationEvents` 的插件在全息探针
+    /// 命中域名前保持休眠，不接收任何 hook。
+    pub activated: Arc<AtomicBool>,
     pub tx: SyncSender<PluginJob>,
 }
 
@@ -106,6 +122,10 @@ pub fn dispatch(subs: &[Subscriber], hook: &str, payload: Value) {
     for sub in subs {
         // 运行时开关：被禁用的插件不派发（挂起语义，线程仍存活但不再收到事件）。
         if !sub.enabled.load(Ordering::Relaxed) {
+            continue;
+        }
+        // beta12 · 模块 E：休眠插件不接收任何 hook，直到全息探针命中其域名。
+        if !sub.activated.load(Ordering::Relaxed) {
             continue;
         }
         if !sub.hooks.contains(hook) {

@@ -17,12 +17,28 @@
 
 pub mod audit;
 pub mod dispatcher;
+/// beta10：`ctx.exec`（FFmpeg / FFprobe 白名单 + 超时杀树）。
+pub mod exec;
+/// beta12：全息探针（按需上报 + 域名懒激活）。
+pub mod holo;
 pub mod hostapi;
+/// beta10.1：拖拽安装（zip / 文件夹）+ 合法性校验 + 预加载回滚。
+pub mod install;
 pub mod interceptor;
+/// beta11：插件日志环形缓冲（`ctx.log` / `console.*` → 日志控制台）。
+pub mod logs;
 pub mod manager;
 pub mod manifest;
+/// beta10：`ctx.httpGet`（SSRF 防护 + 大小/超时上限）。
+pub mod net;
+/// beta10：虚拟任务注册表（插件接管的下载，与 aria2 GID 隔离）。
+pub mod plugin_tasks;
 pub mod quickjs;
 pub mod registry;
+/// beta10：任务路由（manifest.routing → `onTaskDetected` claim）。
+pub mod task_router;
+/// beta10：`ctx.addTasksAndWait`（批量内部任务 + 终态轮询）。
+pub mod tasks;
 /// 运行时抽象层（增量 25）：`PluginRuntime` trait + 后端分流。
 pub mod runtime;
 /// Wasmtime 强隔离后端（增量 25 · P2-D）。由 `wasm-runtime` feature 门控：
@@ -32,7 +48,7 @@ pub mod wasm_runtime;
 
 pub use manager::PluginManager;
 
-/// 插件根目录名（扫描时挂在 `paths::plugins_dir()` 下；开发期 = 仓库根下的 `plugins`）。
+/// 插件根目录名（扫描时挂在 `paths::plugins_dir()` 下；开发期 = 仓库根下的 `data/plugins`）。
 pub fn plugin_root() -> std::path::PathBuf {
     crate::paths::plugins_dir()
 }

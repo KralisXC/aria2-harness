@@ -1,0 +1,37 @@
+{
+  "id": "com.harness.m4s-merger",
+  "name": "网页视频提取",
+  "version": "1.1.2",
+  "description": "点击网页上的悬浮按钮即可提取视频。深度支持 B站，兼容大多数网页的自动嗅探与音视频合并。",
+  "author": "Aria2-Harness",
+  "apiVersion": "1.1",
+  "entry": "main.js",
+  "engine": "js",
+  "priority": 40,
+  "hooks": ["onHolo"],
+  "permissions": ["net:http", "downloads:write", "exec:ffmpeg", "fs:write:downloads", "notify"],
+  "activationEvents": {
+    "domains": ["*.bilibili.com", "*.youtube.com"]
+  },
+  "settings_schema": [
+    {
+      "key": "custom_domains",
+      "label": "自定义解析域名白名单（每行一个，支持 * 通配符）",
+      "type": "textarea",
+      "default": ""
+    }
+  ],
+  "limits": {
+    "timeoutMs": 10000,
+    "taskTimeoutMs": 1800000,
+    "maxHttpBytes": 8388608,
+    "maxTasksPerCall": 8,
+    "memoryMb": 64
+  },
+  "integrity": {
+    "algorithm": "sha256",
+    "files": {
+      "main.js": "1b3075f8a43eb7bada4e4ab30e78aee95c036788be834cfa05ec43869f7d4bbc"
+    }
+  }
+}
